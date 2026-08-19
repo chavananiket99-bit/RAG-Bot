@@ -1,0 +1,658 @@
+//vector_store.py
+import json
+import logging
+import threading
+from pathlib import Path
+
+import faiss
+import numpy as np
+
+from services.embedding_service import embedding_service
+
+logger = logging.getLogger("uvicorn.error")
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+INDEX_DIR = BASE_DIR / "indexes"
+
+FAISS_INDEX_FILE = INDEX_DIR / "faiss.index"
+METADATA_FILE = INDEX_DIR / "faiss_metadata.json"
+
+class FAISSVectorStore:
+    def __init__(self):
+        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.lock = threading.Lock()
+
+        self.dimension = (
+            embedding_service.model.get_embedding_dimension()
+        )
+
+        self.index = None
+        self.metadata = {}
+        self.next_vector_id = 1
+
+        self._load()
+
+    def _load(self):
+        """
+        Load the FAISS index and metadata from disk.
+        """
+
+        if FAISS_INDEX_FILE.exists() :
+
+            logger.info("Loading FAISS index from disk: %s", FAISS_INDEX_FILE)
+
+            self.index = faiss.read_index(str(FAISS_INDEX_FILE))
+
+        else:
+            logger.info("Creating a new FAISS index. Dimension: %s", self.dimension)
+
+            base_index = faiss.IndexFlatIP(self.dimension)
+            self.index = faiss.IndexIDMap2(base_index)
+
+        if METADATA_FILE.exists():
+            try:
+                with open(METADATA_FILE, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+
+                self.metadata = data.get("metadata", {})
+
+                self.next_vector_id = data.get("next_vector_id", 1)
+
+            except Exception as exc:
+                logger.error("Failed to load FAISS metadata: %s", exc)
+
+                self.metadata = {}
+                self.next_vector_id = 1
+
+        logger.info(
+            "FAISS vector count: %s", self.index.ntotal
+        )
+
+        logger.info(
+            "FAISS metadata entries: %s", len(self.metadata)
+        )
+                
+
+    def _save(self):
+        """
+        Persist FAISS index and metadata to disk.
+        """
+
+        temp_index_file = FAISS_INDEX_FILE.with_suffix(".tmp")
+
+        faiss.write_index(self.index, str(temp_index_file))
+
+        temp_index_file.replace(FAISS_INDEX_FILE)
+
+        data = {
+            "next_vector_id": self.next_vector_id,
+            "metadata": self.metadata
+        }
+
+        temp_metadata_file = METADATA_FILE.with_suffix(".tmp")
+
+        with open(temp_metadata_file, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, ensure_ascii=False)
+
+        temp_metadata_file.replace(METADATA_FILE)
+
+    def add_document(self, document_id, filename, chunks):
+        """
+        Add a document's chunks to the FAISS index.
+
+        Each chunk is embedded and added to the index with associated metadata.
+        """
+
+        if not chunks:
+            return 0
+
+        cleaned_chunks = [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
+
+        if not cleaned_chunks:
+            return 0
+
+        logger.info(
+            "Creating embedding for document: %s", filename
+        )
+
+        embeddings = embedding_service.embed_documents(cleaned_chunks)
+
+        vectors = np.asarray(embeddings, dtype="float32")
+
+        vector_ids = []
+
+        metadata_entries = {}
+
+        with self.lock:
+            for index, chunk in enumerate(cleaned_chunks):
+                vector_id = self.next_vector_id
+                self.next_vector_id += 1
+
+                vector_ids.append(vector_id)
+
+                metadata_entries[str(vector_id)] = {
+                    "document_id": document_id,
+                    "filename": filename,
+                    "chunk_index": index,
+                    "text": chunk
+                }
+
+            ids = np.asarray(vector_ids, dtype="int64")
+
+            self.index.add_with_ids(vectors, ids)
+
+            self.metadata.update(metadata_entries)
+
+            self._save()
+
+        logger.info(
+            "Added %s chunks to FAISS for document %s", len(cleaned_chunks), document_id
+        )
+
+        logger.info(
+            "Total vectors in FAISS: %s", self.index.ntotal
+        )
+
+        return len(cleaned_chunks)
+
+    def search(self, query, top_k=5):
+        if not query or not query.strip():
+            return []
+
+        if self.index.ntotal == 0:
+            return []
+
+        query_embedding = embedding_service.embed_text(query)
+
+        query_vector = np.asarray([query_embedding], dtype="float32")
+
+        scores, vectors_ids = self.index.search(query_vector, top_k)
+
+        results = []
+
+        for score, vector_id in zip(scores[0], vectors_ids[0]):
+            if vector_id == -1:
+                continue
+
+            metadata = self.metadata.get(str(int(vector_id)))
+
+            if not metadata:
+                continue
+
+            results.append({
+                "score": float(score),
+                "vector_id": int(vector_id),
+                "document_id": metadata["document_id"],
+                "filename": metadata["filename"],
+                "chunk_index": metadata["chunk_index"],
+                "text": metadata["text"]
+            })
+        return results
+
+    def delete_document(self, document_id):
+        """
+        Remove all chunks associated with a document from the FAISS index.
+        """
+
+        vector_ids = []
+
+        for vector_id, metadata in self.metadata.items():
+            if metadata.get("document_id") == document_id:
+                vector_ids.append(int(vector_id))
+
+        if not vector_ids:
+            logger.info("No FAISS vectors found for document: %s", document_id)
+            return 0
+
+        with self.lock:
+
+            ids = np.asarray(vector_ids, dtype="int64")
+
+            removed = self.index.remove_ids(ids)
+
+            for vector_id in vector_ids:
+                self.metadata.pop(str(vector_id), None)
+
+            self._save()
+
+        logger.info(
+            "Removed %s vectors for document: %s", removed, document_id
+        )
+
+        logger.info(
+            "Total vectors in FAISS after deletion: %s", self.index.ntotal
+        )
+
+        return int(removed)
+
+    def get_document_vector_count(self, document_id):
+        """
+        Get the number of vectors associated with a document.
+        """
+
+        count = 0
+
+        for metadata in self.metadata.values():
+            if metadata.get("document_id") == document_id:
+                count += 1
+
+        return count
+
+    def get_total_vector_count(self):
+        """
+        Get the total number of vectors in the FAISS index.
+        """
+
+        return self.index.ntotal
+
+vector_store = FAISSVectorStore()
+
+// embedding_service.py
+from pathlib import Path
+import logging
+
+from sentence_transformers import SentenceTransformer
+
+logger = logging.getLogger("uvicorn.error")
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_PATH = BASE_DIR / "models" / "all-MiniLM-L6-v2"
+
+class EmbeddingService:
+    def __init__(self):
+        logger.info("Loading embedding model: %s", MODEL_PATH)
+
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(f"Embedding model not found at {MODEL_PATH}")
+
+        self.model = SentenceTransformer(str(MODEL_PATH), local_files_only=True)
+        logger.info("Embedding model loaded successfully.")
+        logger.info("Embedding model dimension: %s", self.model.get_sentence_embedding_dimension())
+
+    def embed_documents(self, texts):
+
+        if not texts:
+            return[]
+
+        embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
+        return embeddings.tolist()
+
+    def embed_text(self, text):
+        if not text or not text.strip():
+            return []
+        
+        embedding = self.model.encode(text, normalize_embeddings=True, show_progress_bar=False)
+    
+        return embedding.tolist()
+
+embedding_service = EmbeddingService()
+
+//app.py
+from fastapi.openapi.utils import get_openapi
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+from typing import Annotated
+from fastapi.middleware.cors import CORSMiddleware
+
+import shutil
+import os
+import time
+import logging
+import uuid
+from pathlib import Path
+
+from services.pdf_service import extract_text
+from models.question import QuestionRequest
+from services.vector_store import vector_store
+from services.gemini_service import ask_gemini
+from services.document_manager import document_manager
+
+from routers.auth import router as auth_router
+
+app = FastAPI()
+app.include_router(auth_router)
+logger = logging.getLogger("uvicorn.error")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_FOLDER = BASE_DIR / "uploads"
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    logger.info(
+        "Request started: %s %s",
+        request.method,
+        request.url.path,
+    )
+    
+    response = await call_next(request)
+    duration_ms = (time.time() - start_time) * 1000
+
+    logger.info(
+        "Request completed: %s %s -> %s (%.2f ms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+
+    return response
+
+@app.get("/")
+def home():
+    return {
+        "message": "PDF RAG Backend Running"
+    }
+
+@app.post("/upload")
+async def upload_files(files: Annotated[list[UploadFile], File(...)]):
+    logger.info(
+        "Multiple upload request received. Files: %s",
+        len(files),
+    )
+
+    uploaded_documents = []
+    failed_documents = []
+
+    for file in files:
+        original_filename = Path(file.filename or "uploaded_file.pdf").name
+
+        logger.info(
+            "Processing uploaded file: %s",
+            original_filename,
+        )
+
+        try:
+            # Create a unique physical filename.
+            unique_id = uuid.uuid4().hex
+            stored_filename = (
+                f"{unique_id}_{original_filename}"
+            )
+
+            file_path = UPLOAD_FOLDER / stored_filename
+
+            logger.info(
+                "Saving physical file: %s",
+                file_path,
+            )
+
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            file_size = os.path.getsize(file_path)
+
+            logger.info(
+                "File saved successfully: %s (%s bytes)",
+                original_filename,
+                file_size,
+            )
+
+            # Extract text and create chunks.
+            result = extract_text(str(file_path))
+
+            text = result["text"]
+            chunks = result["chunks"]
+
+            logger.info(
+                "Text extraction completed: %s | Characters: %s | Chunks: %s",
+                original_filename,
+                len(text),
+                len(chunks),
+            )
+
+            if not chunks:
+                raise ValueError(
+                    "No text chunks could be extracted from the PDF."
+                )
+
+            # Create document metadata.
+            document = document_manager.add_document(
+                filename=original_filename,
+                filesize=file_size,
+                stored_filename=stored_filename,
+            )
+
+            # Add chunks to FAISS.
+            faiss_chunks_added = vector_store.add_document(
+                document_id=document["id"],
+                filename=original_filename,
+                chunks=chunks,
+            )
+
+            logger.info(
+                "FAISS indexing completed for %s: %s chunks added",
+                original_filename,
+                faiss_chunks_added,
+            )
+
+            uploaded_documents.append(
+                {
+                    "document": document,
+                    "characters": len(text),
+                    "chunks": len(chunks),
+                    "faiss_chunks_added": faiss_chunks_added,
+                    "preview": text[:500],
+                }
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Failed to process file: %s",
+                original_filename,
+            )
+
+            # Remove physical file if processing failed.
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception:
+                logger.exception(
+                    "Failed to remove incomplete file: %s",
+                    original_filename,
+                )
+
+            failed_documents.append(
+                {
+                    "filename": original_filename,
+                    "error": str(exc),
+                }
+            )
+    logger.info(
+        "Multiple upload completed. Success: %s | Failed: %s",
+        len(uploaded_documents),
+        len(failed_documents),
+    )
+
+    return {
+        "message": "Upload processing completed.",
+        "total_files": len(files),
+        "successful_files": len(uploaded_documents),
+        "failed_files": len(failed_documents),
+        "documents": uploaded_documents,
+        "failures": failed_documents,
+    }
+
+@app.post("/ask")
+async def ask_question(request: QuestionRequest):
+    logger.info(
+        "Received question: %s",
+        request.question,
+    )
+
+    results = vector_store.search(
+        query=request.question,
+        top_k=15,
+    )
+
+    if not results:
+        return {
+            "question": request.question,
+            "answer": "Please upload PDF first.",
+        }
+
+    logger.info(
+        "FAISS returned %s relevant chunks for question: %s",
+        len(results),
+        request.question,
+    )
+
+    context_parts = []
+
+    for result in results:
+        context_parts.append(
+            f"Document: {result['filename']}\n"
+            f"Chunk: {result['chunk_index']}\n"
+            f"Content:\n{result['text']}"
+        )
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    answer = ask_gemini(
+        context,
+        request.question,
+    )
+
+    return {
+        "question": request.question,
+        "answer": answer,
+    }
+
+@app.get("/documents")
+def list_documents():
+    documents = document_manager.get_documents()
+    return {
+        "total_documents": len(documents),
+        "documents": documents,
+    }
+
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+
+    logger.info(
+        "Delete request received for document: %s",
+        document_id,
+    )
+
+    document = document_manager.delete_document(
+        document_id
+    )
+
+    if document is None:
+        logger.warning(
+            "Document not found for deletion: %s",
+            document_id,
+        )
+
+        return {
+            "success": False,
+            "message": "Document not found.",
+        }
+
+    filename = document["filename"]
+
+    stored_filename = document.get(
+        "stored_filename",
+        filename,
+    )
+
+    logger.info(
+        "Deleting RAG document: %s -> %s",
+        filename,
+        document_id,
+    )
+
+    # Remove vectors from FAISS.
+    faiss_deleted = vector_store.delete_document(
+        document_id
+    )   
+
+    logger.info(
+        "FAISS vectors removed for document %s: %s",
+        document_id,
+        faiss_deleted,
+    )
+
+    # Remove physical PDF.
+    file_path = UPLOAD_FOLDER / stored_filename
+
+    if file_path.exists():
+        try:
+            file_path.unlink()
+            logger.info(
+                "Physical PDF deleted: %s",
+                file_path,
+            )
+
+        except Exception as exc:
+            logger.error(
+                "Could not delete physical PDF %s: %s",
+                file_path,
+                exc,
+            )
+    else:
+        logger.warning(
+            "Physical PDF not found: %s",
+            file_path,
+        )
+
+    return {
+        "success": True,
+        "message": "Document deleted successfully.",
+        "document": document,
+        "faiss_vectors_deleted": faiss_deleted,
+    }
+
+@app.get("/auth/sso")
+async def sso_login():
+    raise HTTPException(
+        status_code=501,
+        detail="SSO login not implemented yet. Please use the demo login.",
+    )
+
+def custom_openapi():
+   if app.openapi_schema:
+       return app.openapi_schema
+   schema = get_openapi(
+       title=app.title,
+       version="1.0.0",
+       description="PDF RAG Backend API",
+       routes=app.routes,
+   )
+   components = schema.get("components", {}).get("schemas", {})
+   for component in components.values():
+       properties = component.get("properties", {})
+       for prop in properties.values():
+           # Array of uploaded files
+           if (
+               prop.get("type") == "array"
+               and isinstance(prop.get("items"), dict)
+           ):
+               items = prop["items"]
+               if items.get("contentMediaType") == "application/octet-stream":
+                   items.pop("contentMediaType", None)
+                   items["type"] = "string"
+                   items["format"] = "binary"
+           # Single uploaded file
+           elif (
+               prop.get("type") == "string"
+               and prop.get("contentMediaType") == "application/octet-stream"
+           ):
+               prop.pop("contentMediaType", None)
+               prop["format"] = "binary"
+   app.openapi_schema = schema
+   return app.openapi_schema
+
+app.openapi = custom_openapi
