@@ -1,4 +1,40 @@
-services/vector_score.py
+services/gemini_service.py
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# print("API Key:", GEMINI_API_KEY)
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+model = genai.GenerativeModel("gemini-3.5-flash")
+
+def ask_gemini(context, question):
+    prompt = f"""
+You are an AI assistant.
+
+Answer only using the provided context.
+
+If the answer is not present in the context, reply:
+"I couldn't find that information in the uploaded document."
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+    response = model.generate_content(prompt)
+
+    return response.text
+
+services/vector_store.py
 import json
 import logging
 import threading
@@ -1116,175 +1152,38 @@ class FAISSVectorStore:
 
 vector_store = FAISSVectorStore()
 
-services/gemini_service.py
-import google.generativeai as genai
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# print("API Key:", GEMINI_API_KEY)
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-model = genai.GenerativeModel("gemini-3.5-flash")
-
-def ask_gemini(context, question):
-    prompt = f"""
-You are an AI assistant.
-
-Answer only using the provided context.
-
-If the answer is not present in the context, reply:
-"I couldn't find that information in the uploaded document."
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-
-    response = model.generate_content(prompt)
-
-    return response.text
-
-services/pdf_service.py
-from services.pdf_reader import read_pdf
-from services.ocr_reader import read_scanned_pdf
-from services.chunk_service import split_text
-
-import logging
-
-logger = logging.getLogger("uvicorn.error")
-
-def extract_text(pdf_path):
-    logger.info("Extracting text...")
-
-    text = read_pdf(pdf_path)
-
-    if not text.strip():
-        logger.info("performing OCR...")
-        text = read_scanned_pdf(pdf_path)
-
-    chunks = split_text(text)
-
-    return {"text": text, "chunks": chunks}
-
-services/document_manager.py
-import json
-import uuid
-from pathlib import Path
-from datetime import datetime
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-METADATA_DIR = BASE_DIR / "metadata"
-METADATA_FILE = METADATA_DIR / "documents.json"
-
-class DocumentManager:
-    def __init__(self):
-        METADATA_DIR.mkdir(exist_ok=True)
-
-        if not METADATA_FILE.exists():
-            METADATA_FILE.write_text("[]", encoding='utf-8')
-
-    def get_documents(self):
-        with open(METADATA_FILE, 'r', encoding='utf-8') as file:
-            return json.load(file)
-
-    def save_documents(self, documents):
-        with open(METADATA_FILE, "w", encoding='utf-8') as file:
-            json.dump(documents, file, indent=4, ensure_ascii=False,)
-
-    def add_document(self, filename, filesize, stored_filename=None):
-        documents = self.get_documents()
-
-        document = {
-            "id": str(uuid.uuid4()),
-            "filename": filename,
-            "stored_filename": stored_filename or filename,
-            "filesize": filesize,
-            "uploaded_at": datetime.now().isoformat(),
-            "status": "Indexed"
-        }
-
-        documents.append(document)
-        self.save_documents(documents)
-        
-        return document
-
-    def delete_document(self, document_id):
-        documents = self.get_documents()
-        document_to_delete = None
-
-        for document in documents:
-            if document.get("id") == document_id:
-                document_to_delete = document
-                break
-
-        if document_to_delete is None:
-            return None
-
-        documents = [
-            document for document in documents if document.get("id") != document_id
-        ]
-
-        self.save_documents(documents)
-        return document_to_delete
-
-document_manager = DocumentManager()
-
-
-moels/question.py
-from pydantic import BaseModel
-
-class QuestionRequest(BaseModel):
-    question: str
-
-routers/auth.py
-from fastapi import APIRouter, HTTPException
-
-from models.auth import LoginRequest
-from services.auth_service import auth_service
-
-router = APIRouter(
-    prefix="/auth",
-    tags=["Authentication"]
-)
-
-@router.post("/login")
-def login(request: LoginRequest):
-    user = auth_service.authenticate(username=request.username, password=request.password)
-
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-
-    return {
-        "success": True,
-        "user": user
-    }
-
-src/main.jsx
-import { StrictMode } from "react";
-import { createRoot } from "react-dom/client";
-
-import "./index.css";
-import App from "./App.jsx";
-
-import { UploadProvider } from "./context/UploadContext.jsx";
-import { AuthProvider } from "./context/AuthContext.jsx";
-
-createRoot(document.getElementById("root")).render(
-  <StrictMode>
-    <AuthProvider>
-      <UploadProvider>
-        <App />
-      </UploadProvider>
-    </AuthProvider>
-  </StrictMode>,
-);
-
+src/components/MessageBubble.jsx
+import { Bot, UserRound } from "lucide-react";
+export default function MessageBubble({ sender, text }) {
+  const isUser = sender === "user";
+  return (
+    <div
+      className={`flex items-start gap-3 ${
+        isUser ? "justify-end" : "justify-start"
+      }`}
+    >
+      {/* AI icon */}
+      {!isUser && (
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-red-50">
+          <Bot size={18} className="text-red-700" />
+        </div>
+      )}
+      {/* Message */}
+      <div
+        className={`max-w-[75%] rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm ${
+          isUser
+            ? "rounded-tr-md bg-red-700 text-white"
+            : "rounded-tl-md border border-slate-200 bg-white text-slate-700"
+        }`}
+      >
+        <div className="whitespace-pre-wrap break-words">{text}</div>
+      </div>
+      {/* User icon */}
+      {isUser && (
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-200">
+          <UserRound size={18} className="text-slate-600" />
+        </div>
+      )}
+    </div>
+  );
+}
