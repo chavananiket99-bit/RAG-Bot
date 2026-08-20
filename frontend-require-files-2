@@ -1,0 +1,419 @@
+src/context/AuthContext.jsx
+import { createContext, useContext, useState, useEffect, useMemo } from "react";
+
+const AuthContext = createContext(null);
+const AUTH_STORAGE_KEY = "rag_auth";
+
+function loadStoredAuth() {
+  try {
+    const saved = localStorage.getItem(AUTH_STORAGE_KEY);
+
+    if (!saved) {
+      return null;
+    }
+
+    return JSON.parse(saved);
+  } catch (error) {
+    console.error("Failed to restore authentication:", error);
+    return null;
+  }
+}
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(() => loadStoredAuth());
+
+  useEffect(() => {
+    if (user) {
+      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(user));
+    } else {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+    }
+  }, [user]);
+
+  const login = async ({ username, password }) => {
+    if (!username?.trim() || !password) {
+      throw new Error("Username and password are required.");
+    }
+    const response = await fetch("http://127.0.0.1:8000/auth/login", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        username: username.trim(),
+        password,
+      }),
+    });
+    let data = {};
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+    if (!response.ok) {
+      throw new Error(
+        data?.detail ||
+          data?.message ||
+          "Unable to sign in. Please check your credentials.",
+      );
+    }
+    const authenticatedUser = {
+      id: data.user?.id || data.id || username.trim(),
+      name: data.user?.name || data.name || username.trim(),
+      username: data.user?.username || data.username || username.trim(),
+      loginType: "form",
+    };
+    setUser(authenticatedUser);
+    return authenticatedUser;
+  };
+
+  const loginWithSSO = async () => {
+    const response = await fetch(
+      `${import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"}/auth/sso`,
+      {
+        method: "GET",
+        credentials: "include",
+      },
+    );
+    if (!response.ok) {
+      let message = "Corporate SSO is currently unavailable.";
+      try {
+        const data = await response.json();
+        message = data?.detail || data?.message || message;
+      } catch {}
+      throw new Error(message);
+    }
+    const data = await response.json();
+    if (!data?.authenticated || !data?.user) {
+      throw new Error("Corporate SSO authentication was not completed.");
+    }
+    setUser(data.user);
+    return data.user;
+  };
+
+  const logout = () => {
+    setUser(null);
+  };
+
+  const value = useMemo(
+    () => ({
+      user,
+      isAuthenticated: Boolean(user),
+      login,
+      loginWithSSO,
+      logout,
+    }),
+    [user],
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth() {
+  const context = useContext(AuthContext);
+
+  if (!context) {
+    throw new Error("useAuth must be used within an AuthProvider");
+  }
+  return context;
+}
+
+src/context/UploadContext.jsx
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useCallback,
+} from "react";
+import { getDocuments } from "../services/api";
+const UploadContext = createContext();
+/*
+ * Convert backend documents into one standard frontend format.
+ */
+function normalizeDocument(doc, index = 0) {
+  if (!doc) return null;
+  // Backend document
+  if (typeof doc === "object") {
+    return {
+      id:
+        doc.id ||
+        doc.file_id ||
+        doc.filename ||
+        doc.name ||
+        `document-${index}`,
+      filename: doc.filename || doc.name || "Unnamed document",
+      status: doc.status || "Indexed",
+    };
+  }
+  // Fallback for string filenames
+  if (typeof doc === "string") {
+    return {
+      id: doc,
+      filename: doc,
+      status: "Indexed",
+    };
+  }
+  return null;
+}
+function normalizeDocuments(documents) {
+  if (!Array.isArray(documents)) {
+    return [];
+  }
+  return documents
+    .map((doc, index) => normalizeDocument(doc, index))
+    .filter(Boolean);
+}
+export function UploadProvider({ children }) {
+  const [uploadedFiles, setUploadedFiles] = useState(() => {
+    try {
+      const saved = localStorage.getItem("uploadedFiles");
+      if (!saved) {
+        return [];
+      }
+      const parsed = JSON.parse(saved);
+      return normalizeDocuments(parsed);
+    } catch (error) {
+      console.error("Failed to restore uploaded files:", error);
+      return [];
+    }
+  });
+  const [messages, setMessages] = useState(() => {
+    try {
+      const saved = localStorage.getItem("messages");
+      return saved ? JSON.parse(saved) : [];
+    } catch (error) {
+      console.error("Failed to restore messages:", error);
+      return [];
+    }
+  });
+  const [loading, setLoading] = useState(false);
+  const [typing, setTyping] = useState(false);
+  const [currentConversation, setCurrentConversation] = useState(null);
+  const [documentsLoading, setDocumentsLoading] = useState(false);
+  /*
+   * Load documents from backend.
+   */
+  const refreshDocuments = useCallback(async () => {
+    try {
+      setDocumentsLoading(true);
+      const data = await getDocuments();
+      const backendDocuments = data?.documents || [];
+      const normalizedDocuments = normalizeDocuments(backendDocuments);
+      setUploadedFiles(normalizedDocuments);
+    } catch (error) {
+      console.error("Failed to load documents from backend:", error);
+    } finally {
+      setDocumentsLoading(false);
+    }
+  }, []);
+  /*
+   * Persist uploaded documents.
+   */
+  useEffect(() => {
+    localStorage.setItem("uploadedFiles", JSON.stringify(uploadedFiles));
+  }, [uploadedFiles]);
+  /*
+   * Persist chat messages.
+   */
+  useEffect(() => {
+    localStorage.setItem("messages", JSON.stringify(messages));
+  }, [messages]);
+  /*
+   * Load backend documents when application starts.
+   */
+  useEffect(() => {
+    refreshDocuments();
+  }, [refreshDocuments]);
+  return (
+    <UploadContext.Provider
+      value={{
+        uploadedFiles,
+        setUploadedFiles,
+        messages,
+        setMessages,
+        loading,
+        setLoading,
+        typing,
+        setTyping,
+        currentConversation,
+        setCurrentConversation,
+        documentsLoading,
+        refreshDocuments,
+      }}
+    >
+      {children}
+    </UploadContext.Provider>
+  );
+}
+export function useUpload() {
+  return useContext(UploadContext);
+}
+
+src/components/UploadedDocuments.jsx
+import { useState } from "react";
+import {
+  FileText,
+  X,
+  Files,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+} from "lucide-react";
+import { useUpload } from "../context/UploadContext";
+import { deleteDocument } from "../services/api";
+
+export default function UploadedDocuments() {
+  const { uploadedFiles, refreshDocuments } = useUpload();
+  const [deletingId, setDeletingId] = useState(null);
+  const [deleteError, setDeleteError] = useState("");
+
+  const removeFile = async (document) => {
+    if (!document?.id) {
+      setDeleteError(
+        "This document cannot be removed because its document ID is missing.",
+      );
+      return;
+    }
+    if (deletingId) {
+      return;
+    }
+    setDeleteError("");
+    setDeletingId(document.id);
+    try {
+      await deleteDocument(document.id);
+      /*
+       * Backend is the source of truth.
+       * Reload the document list instead of manually
+       * removing the item from React state.
+       */
+      await refreshDocuments();
+    } catch (error) {
+      console.error("Document deletion failed:", error);
+      setDeleteError(
+        error?.response?.data?.detail ||
+          error?.message ||
+          "Unable to delete the document. Please try again.",
+      );
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  if (!uploadedFiles || uploadedFiles.length === 0) {
+    return null;
+  }
+  return (
+    <section className="border-b border-slate-200 bg-white">
+      {/* =====================================================
+         HEADER
+     ====================================================== */}
+      <div className="flex flex-col gap-3 px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-red-50">
+            <Files size={19} className="text-red-700" />
+          </div>
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold text-slate-800">
+              Knowledge Documents
+            </h2>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Documents available to the AI assistant
+            </p>
+          </div>
+        </div>
+        <div className="flex w-fit items-center gap-2 rounded-full bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-600">
+          <span>
+            {uploadedFiles.length}{" "}
+            {uploadedFiles.length === 1 ? "document" : "documents"}
+          </span>
+        </div>
+      </div>
+      {/* =====================================================
+         DELETE ERROR
+     ====================================================== */}
+      {deleteError && (
+        <div className="mx-6 mb-3 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700">
+          <AlertCircle size={15} className="mt-0.5 shrink-0" />
+          <span>{deleteError}</span>
+          <button
+            type="button"
+            onClick={() => setDeleteError("")}
+            className="ml-auto shrink-0 rounded-md p-0.5 text-red-400 transition hover:bg-red-100 hover:text-red-700"
+            aria-label="Dismiss error"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+      {/* =====================================================
+         DOCUMENT STRIP
+     ====================================================== */}
+      <div className="flex gap-3 overflow-x-auto px-6 pb-5">
+        {uploadedFiles.map((file, index) => {
+          const filename =
+            file?.filename || file?.name || `Document ${index + 1}`;
+          const isDeleting = deletingId === file?.id;
+          return (
+            <div
+              key={file?.id || file?.filename || file?.name || index}
+              className={`group relative flex min-w-[250px] max-w-[300px] items-center gap-3 rounded-xl border bg-white px-3.5 py-3 transition ${
+                isDeleting
+                  ? "border-red-200 bg-red-50/40 opacity-70"
+                  : "border-slate-200 hover:border-red-200 hover:bg-red-50/20 hover:shadow-sm"
+              }`}
+            >
+              {/* =================================================
+                 DOCUMENT ICON
+             ================================================== */}
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-red-50">
+                <FileText size={20} className="text-red-700" />
+              </div>
+              {/* =================================================
+                 DOCUMENT INFORMATION
+             ================================================== */}
+              <div className="min-w-0 flex-1">
+                <p
+                  className="truncate text-sm font-medium text-slate-700"
+                  title={filename}
+                >
+                  {filename}
+                </p>
+                <div className="mt-1 flex items-center gap-1.5">
+                  <CheckCircle2
+                    size={12}
+                    className="shrink-0 text-emerald-500"
+                  />
+                  <p className="truncate text-[11px] text-slate-400">
+                    {file?.status || "Indexed"}
+                  </p>
+                </div>
+              </div>
+              {/* =================================================
+                 DELETE BUTTON
+             ================================================== */}
+              <button
+                type="button"
+                onClick={() => removeFile(file)}
+                disabled={Boolean(deletingId)}
+                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
+                  isDeleting
+                    ? "cursor-wait bg-red-50 text-red-600"
+                    : "text-slate-400 opacity-0 hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
+                } disabled:cursor-not-allowed`}
+                title={isDeleting ? "Removing document..." : "Remove document"}
+                aria-label={`Remove ${filename}`}
+              >
+                {isDeleting ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : (
+                  <X size={16} />
+                )}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
