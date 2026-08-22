@@ -1,1211 +1,1301 @@
-src/components/UploadArea.jsx
-import { Upload, FileText } from "lucide-react";
-
-export default function UploadArea({ file, onChange, onUpload, loading }) {
-  return (
-    <div className="mx-auto max-w-3xl rounded-2xl border-2 border-dashed border-red-300 bg-white p-10 shadow">
-      <div className="flex flex-col items-center">
-        <Upload className="text-red-700" size={60} />
-        <h2 className="mt-5 text-2xl font-bold text-gray-800">
-          Upload Documents
-        </h2>
-        <p className="mt-2 text-gray-500 text-center">
-          Upload one or more PDF files to chat with your documents.
-        </p>
-
-        <input
-          type="file"
-          multiple
-          accept=".pdf"
-          onChange={onChange}
-          className="mt-8"
-        />
-
-        {file?.length > 0 && (
-          <div className="mt-6 w-full">
-            {Array.from(file).map((f, index) => (
-              <div
-                key={index}
-                className="flex items-center gap-3 rounded-lg border p-3 mt-2"
-              >
-                <FileText className="text-red-700" size={20} />
-                <span>{f.name}</span>
-              </div>
-            ))}
-          </div>
-        )}
-
-        <button
-          onClick={onUpload}
-          disabled={loading}
-          className="mt-8 rounded-lg bg-red-700 px-8 py-3 text-white hover:bg-red-800"
-        >
-          {loading ? "Uploading..." : "Upload"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-src/components/UploadCard.jsx
-import { useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { CheckCircle2, FileText, Loader2, UploadCloud, X } from "lucide-react";
-import { uploadPdf } from "../services/api";
-import { useUpload } from "../context/UploadContext";
-export default function UploadCard() {
-  const { refreshDocuments } = useUpload();
-  const navigate = useNavigate();
-  const fileInputRef = useRef(null);
-  const [files, setFiles] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
-  const [error, setError] = useState("");
-  const [progress, setProgress] = useState(0);
-  const [status, setStatus] = useState("");
-  const onFileChange = (event) => {
-    const selectedFiles = Array.from(event.target.files || []);
-    const pdfFiles = selectedFiles.filter(
-      (file) => file.type === "application/pdf",
-    );
-    setFiles(pdfFiles);
-    setResult(null);
-    setError("");
-    setProgress(0);
-    setStatus("");
-  };
-  const removeFile = (index) => {
-    setFiles((previous) => previous.filter((_, i) => i !== index));
-    setResult(null);
-    setError("");
-  };
-  const onUpload = async () => {
-    if (!files || files.length === 0) {
-      setError("Please select at least one PDF document.");
-      return;
-    }
-    try {
-      setLoading(true);
-      setError("");
-      setResult(null);
-      setProgress(10);
-      setStatus("Uploading document...");
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      setProgress(30);
-      setStatus("Reading document...");
-      /*
-       * Current backend supports one PDF per /upload request.
-       * Keep the existing working backend behavior.
-       */
-      const data = await uploadPdf(files[0]);
-      setResult(data);
-      setProgress(70);
-      setStatus("Creating AI knowledge...");
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      /*
-       * Refresh normalized documents from backend.
-       */
-      await refreshDocuments();
-      setProgress(100);
-      setStatus("Document uploaded successfully.");
-      /*
-       * Move to Chat after successful upload.
-       */
-      setTimeout(() => {
-        navigate("/chat");
-      }, 900);
-    } catch (err) {
-      const message =
-        err?.response?.data?.detail ||
-        err?.message ||
-        "Upload failed. Please check the backend server.";
-      setError(String(message));
-      setProgress(0);
-      setStatus("");
-    } finally {
-      setLoading(false);
-    }
-  };
-  return (
-    <div className="w-full max-w-3xl">
-      {/* Upload area */}
-      <div
-        className={`
-         relative overflow-hidden rounded-2xl
-         border-2 border-dashed
-         bg-slate-50
-         p-6 sm:p-8
-         transition-all duration-200
-         ${
-           loading
-             ? "border-red-300 bg-red-50/30"
-             : "border-slate-300 hover:border-red-400 hover:bg-red-50/20"
-         }
-       `}
-      >
-        {/* Decorative background */}
-        <div className="pointer-events-none absolute -right-16 -top-16 h-40 w-40 rounded-full bg-red-100/50 blur-3xl" />
-        <div className="relative">
-          {/* Icon */}
-          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-red-50">
-            {loading ? (
-              <Loader2 size={30} className="animate-spin text-red-700" />
-            ) : (
-              <UploadCloud size={30} className="text-red-700" />
-            )}
-          </div>
-          {/* Heading */}
-          <div className="mt-5 text-center">
-            <h3 className="text-lg font-semibold text-slate-800">
-              Upload your PDF documents
-            </h3>
-            <p className="mx-auto mt-2 max-w-lg text-sm leading-6 text-slate-500">
-              Add enterprise documents to your knowledge base and make them
-              available to the AI assistant.
-            </p>
-          </div>
-          {/* Select button */}
-          <div className="mt-6 flex justify-center">
-            <button
-              type="button"
-              disabled={loading}
-              onClick={() => fileInputRef.current?.click()}
-              className="
-               inline-flex items-center gap-2
-               rounded-xl
-               bg-red-700
-               px-5 py-3
-               text-sm font-semibold text-white
-               shadow-sm
-               transition
-               hover:bg-red-800
-               disabled:cursor-not-allowed
-               disabled:opacity-50
-             "
-            >
-              <UploadCloud size={18} />
-              Select PDF
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept="application/pdf"
-              onChange={onFileChange}
-              className="hidden"
-            />
-          </div>
-          <p className="mt-3 text-center text-xs text-slate-400">
-            PDF files only
-          </p>
-          {/* Selected files */}
-          {files.length > 0 && (
-            <div className="mt-7">
-              <div className="mb-3 flex items-center justify-between">
-                <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                  Selected document
-                  {files.length > 1 ? "s" : ""}
-                </p>
-                <span className="rounded-full bg-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600">
-                  {files.length}
-                </span>
-              </div>
-              <div className="space-y-2">
-                {files.map((file, index) => (
-                  <div
-                    key={`${file.name}-${index}`}
-                    className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm"
-                  >
-                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-red-50">
-                      <FileText size={19} className="text-red-700" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <p
-                        className="truncate text-sm font-medium text-slate-700"
-                        title={file.name}
-                      >
-                        {file.name}
-                      </p>
-                      <p className="mt-0.5 text-xs text-slate-400">
-                        {(file.size / 1024 / 1024).toFixed(2)} MB · PDF
-                      </p>
-                    </div>
-                    {!loading && (
-                      <button
-                        type="button"
-                        onClick={() => removeFile(index)}
-                        className="rounded-lg p-2 text-slate-400 transition hover:bg-red-50 hover:text-red-600"
-                        title="Remove document"
-                      >
-                        <X size={17} />
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-              {/* Upload button */}
-              <button
-                type="button"
-                onClick={onUpload}
-                disabled={loading}
-                className="
-                 mt-4
-                 flex w-full
-                 items-center justify-center gap-2
-                 rounded-xl
-                 bg-slate-900
-                 px-5 py-3
-                 text-sm font-semibold text-white
-                 shadow-sm
-                 transition
-                 hover:bg-slate-800
-                 disabled:cursor-not-allowed
-                 disabled:opacity-50
-               "
-              >
-                {loading ? (
-                  <>
-                    <Loader2 size={18} className="animate-spin" />
-                    Processing document...
-                  </>
-                ) : (
-                  <>
-                    <UploadCloud size={18} />
-                    Upload to Knowledge Base
-                  </>
-                )}
-              </button>
-            </div>
-          )}
-          {/* Progress */}
-          {loading && (
-            <div className="mt-6 rounded-xl border border-slate-200 bg-white p-4">
-              <div className="mb-2 flex items-center justify-between">
-                <span className="text-xs font-medium text-slate-600">
-                  {status}
-                </span>
-                <span className="text-xs font-semibold text-red-700">
-                  {progress}%
-                </span>
-              </div>
-              <div className="h-2 overflow-hidden rounded-full bg-slate-100">
-                <div
-                  className="h-full rounded-full bg-red-700 transition-all duration-500"
-                  style={{
-                    width: `${progress}%`,
-                  }}
-                />
-              </div>
-            </div>
-          )}
-          {/* Success */}
-          {result && !loading && (
-            <div className="mt-6 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
-              <div className="flex items-start gap-3">
-                <CheckCircle2
-                  size={20}
-                  className="mt-0.5 shrink-0 text-emerald-600"
-                />
-                <div className="min-w-0">
-                  <p className="text-sm font-semibold text-emerald-800">
-                    Document uploaded successfully
-                  </p>
-                  <p className="mt-1 text-xs leading-5 text-emerald-700">
-                    Your document has been added to the AI knowledge base.
-                  </p>
-                  {result.characters && (
-                    <p className="mt-2 text-[11px] text-emerald-600">
-                      {result.characters.toLocaleString()} characters processed
-                    </p>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-          {/* Error */}
-          {error && (
-            <div className="mt-5 rounded-xl border border-red-200 bg-red-50 px-4 py-3">
-              <p className="text-sm text-red-700">{error}</p>
-            </div>
-          )}
-        </div>
-      </div>
-      {/* Information below upload box */}
-      <div className="mt-4 flex flex-col gap-2 text-center text-[11px] text-slate-400 sm:flex-row sm:items-center sm:justify-center sm:gap-5">
-        <span>✓ Secure document processing</span>
-        <span>✓ AI-powered document search</span>
-        <span>✓ Enterprise knowledge base</span>
-      </div>
-    </div>
-  );
-}
-
-src/pages/Dashboard.jsx
-import { useNavigate } from "react-router-dom";
-import {
-  ArrowRight,
-  Bot,
-  CheckCircle2,
-  FileText,
-  MessageSquare,
-  Search,
-  ShieldCheck,
-  UploadCloud,
-  Activity,
-  Sparkles,
-} from "lucide-react";
-
-import { useUpload } from "../context/UploadContext";
-import UploadCard from "../components/UploadCard";
-
-export default function Dashboard() {
-  const navigate = useNavigate();
-
-  const { uploadedFiles = [], messages = [], documentsLoading } = useUpload();
-
-  const documentCount = uploadedFiles.length;
-
-  const chatCount = messages.filter(
-    (message) => message.role === "user",
-  ).length;
-
-  const knowledgeStatus = documentCount > 0 ? "Ready" : "Waiting";
-
-  return (
-    <div className="min-h-full bg-slate-50">
-      <div className="mx-auto w-full max-w-7xl px-4 py-5 sm:px-6 sm:py-6 lg:px-8">
-        {/* =====================================================
-            HERO
-        ====================================================== */}
-        <section className="relative overflow-hidden rounded-2xl bg-slate-950 shadow-lg">
-          {/* Decorative background */}
-          <div className="pointer-events-none absolute -right-24 -top-24 h-72 w-72 rounded-full bg-red-700/20 blur-3xl" />
-
-          <div className="pointer-events-none absolute -bottom-32 left-1/3 h-72 w-72 rounded-full bg-red-700/10 blur-3xl" />
-
-          <div className="relative px-5 py-7 sm:px-8 sm:py-9 lg:px-10">
-            <div className="flex flex-col gap-7 lg:flex-row lg:items-center lg:justify-between">
-              {/* Hero content */}
-              <div className="max-w-3xl">
-                <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/80 px-3 py-1.5">
-                  <Activity size={14} className="text-emerald-400" />
-
-                  <span className="text-xs font-medium text-slate-300">
-                    Enterprise AI Workspace
-                  </span>
-                </div>
-
-                <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl lg:text-4xl">
-                  Welcome back, Demo User
-                </h1>
-
-                <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-400 sm:text-base">
-                  Your intelligent document knowledge workspace. Upload
-                  enterprise documents and use AI to find relevant information
-                  quickly.
-                </p>
-              </div>
-
-              {/* Chat CTA */}
-              <button
-                type="button"
-                onClick={() => navigate("/chat")}
-                className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-red-700 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-red-950/30 transition hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 focus:ring-offset-slate-950"
-              >
-                <Bot size={18} />
-                <span>Open AI Chat</span>
-                <ArrowRight size={17} />
-              </button>
-            </div>
-          </div>
-        </section>
-
-        {/* =====================================================
-            STAT CARDS
-        ====================================================== */}
-        <section className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <StatCard
-            label="Documents"
-            value={documentsLoading ? "—" : documentCount}
-            description="Uploaded knowledge sources"
-            icon={FileText}
-            iconClass="bg-red-50 text-red-700"
-          />
-
-          <StatCard
-            label="AI Conversations"
-            value={chatCount}
-            description="Questions asked in this session"
-            icon={MessageSquare}
-            iconClass="bg-blue-50 text-blue-600"
-          />
-
-          <StatCard
-            label="Knowledge Base"
-            value={knowledgeStatus}
-            description="Document search availability"
-            icon={CheckCircle2}
-            iconClass="bg-emerald-50 text-emerald-600"
-          />
-
-          <StatCard
-            label="System"
-            value="Online"
-            description="AI assistant available"
-            icon={ShieldCheck}
-            iconClass="bg-emerald-50 text-emerald-600"
-          />
-        </section>
-
-        {/* =====================================================
-            UPLOAD DOCUMENTS
-        ====================================================== */}
-        <section className="enterprise-card mt-5 p-5 sm:p-6">
-          <div className="mb-6 flex items-start gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-50">
-              <UploadCloud size={20} className="text-red-700" />
-            </div>
-
-            <div>
-              <h2 className="enterprise-section-title">Upload Documents</h2>
-
-              <p className="enterprise-section-description">
-                Add PDF documents to your enterprise AI knowledge base.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex justify-center">
-            <UploadCard />
-          </div>
-        </section>
-
-        {/* =====================================================
-            DOCUMENTS + QUICK ACTIONS
-        ====================================================== */}
-        <section className="mt-5 grid gap-5 lg:grid-cols-3">
-          {/* Recent Documents */}
-          <div className="enterprise-card overflow-hidden lg:col-span-2">
-            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-              <div>
-                <h2 className="enterprise-section-title">Recent Documents</h2>
-
-                <p className="enterprise-section-description">
-                  Documents currently available to the AI
-                </p>
-              </div>
-
-              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-50">
-                <FileText size={18} className="text-slate-500" />
-              </div>
-            </div>
-
-            <div className="p-3">
-              {documentsLoading ? (
-                <div className="px-3 py-10 text-center">
-                  <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100">
-                    <Activity
-                      size={19}
-                      className="animate-pulse text-slate-400"
-                    />
-                  </div>
-
-                  <p className="mt-3 text-sm text-slate-400">
-                    Loading documents...
-                  </p>
-                </div>
-              ) : documentCount === 0 ? (
-                <EmptyDocuments />
-              ) : (
-                <div className="space-y-1">
-                  {uploadedFiles.slice(0, 5).map((document, index) => {
-                    const filename =
-                      document?.filename ||
-                      document?.name ||
-                      `Document ${index + 1}`;
-
-                    const documentKey =
-                      document?.id ||
-                      document?.filename ||
-                      document?.name ||
-                      index;
-
-                    return (
-                      <div
-                        key={documentKey}
-                        className="group flex items-center gap-3 rounded-xl px-3 py-3 transition hover:bg-slate-50"
-                      >
-                        {/* PDF icon */}
-                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-red-50">
-                          <FileText size={19} className="text-red-700" />
-                        </div>
-
-                        {/* Filename */}
-                        <div className="min-w-0 flex-1">
-                          <p
-                            className="truncate text-sm font-medium text-slate-700 group-hover:text-slate-900"
-                            title={filename}
-                          >
-                            {filename}
-                          </p>
-
-                          <p className="mt-0.5 text-xs text-slate-400">
-                            {document?.status || "Available for AI search"}
-                          </p>
-                        </div>
-
-                        {/* Status */}
-                        <div className="flex shrink-0 items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1">
-                          <CheckCircle2
-                            size={13}
-                            className="text-emerald-600"
-                          />
-
-                          <span className="hidden text-[10px] font-medium text-emerald-700 sm:inline">
-                            Ready
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            {/* View all */}
-            {documentCount > 5 && (
-              <div className="border-t border-slate-100 px-5 py-3">
-                <button
-                  type="button"
-                  onClick={() => navigate("/chat")}
-                  className="inline-flex items-center gap-1 text-xs font-medium text-red-700 transition hover:text-red-800"
-                >
-                  View all documents
-                  <ArrowRight size={14} />
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* =====================================================
-              QUICK ACTIONS
-          ====================================================== */}
-          <div className="enterprise-card overflow-hidden">
-            <div className="border-b border-slate-100 px-5 py-4">
-              <h2 className="enterprise-section-title">Quick Actions</h2>
-
-              <p className="enterprise-section-description">
-                Common workspace actions
-              </p>
-            </div>
-
-            <div className="space-y-2 p-4">
-              {/* Ask AI */}
-              <QuickAction
-                icon={Bot}
-                title="Ask AI"
-                description="Search your uploaded documents"
-                onClick={() => navigate("/chat")}
-                highlighted
-              />
-
-              {/* Search Knowledge */}
-              <QuickAction
-                icon={Search}
-                title="Search Knowledge"
-                description="Find information across documents"
-                onClick={() => navigate("/chat")}
-              />
-
-              {/* Upload */}
-              <QuickAction
-                icon={UploadCloud}
-                title="Upload Document"
-                description="Add another PDF to the knowledge base"
-                onClick={() => {
-                  document.querySelector('input[type="file"]')?.click();
-                }}
-              />
-            </div>
-          </div>
-        </section>
-
-        {/* =====================================================
-            HOW IT WORKS
-        ====================================================== */}
-        <section className="mt-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-          <div className="flex items-start gap-4">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-50">
-              <Sparkles size={20} className="text-red-700" />
-            </div>
-
-            <div>
-              <h2 className="enterprise-section-title">
-                How Enterprise AI works
-              </h2>
-
-              <p className="enterprise-section-description">
-                Your documents form the knowledge base used by the AI assistant.
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <WorkflowStep
-              number="01"
-              title="Upload"
-              description="Upload enterprise PDF documents."
-            />
-
-            <WorkflowStep
-              number="02"
-              title="Process"
-              description="Documents are extracted and indexed."
-            />
-
-            <WorkflowStep
-              number="03"
-              title="Ask"
-              description="Ask natural-language questions."
-            />
-
-            <WorkflowStep
-              number="04"
-              title="Answer"
-              description="AI responds using document knowledge."
-            />
-          </div>
-        </section>
-
-        {/* Footer */}
-        <div className="py-6 text-center">
-          <p className="text-[11px] text-slate-400">
-            Mahindra Enterprise AI Knowledge Assistant
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* =============================================================
-   STAT CARD
-============================================================= */
-
-function StatCard({ label, value, description, icon: Icon, iconClass }) {
-  return (
-    <div className="enterprise-card p-5 transition duration-200 hover:-translate-y-0.5 hover:shadow-md">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <p className="text-xs font-medium uppercase tracking-wider text-slate-400">
-            {label}
-          </p>
-
-          <p className="mt-2 truncate text-2xl font-semibold text-slate-800 sm:text-3xl">
-            {value}
-          </p>
-
-          <p className="mt-1 text-xs text-slate-500">{description}</p>
-        </div>
-
-        <div
-          className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ${iconClass}`}
-        >
-          <Icon size={21} />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* =============================================================
-   QUICK ACTION
-============================================================= */
-
-function QuickAction({
-  icon: Icon,
-  title,
-  description,
-  onClick,
-  highlighted = false,
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`
-        group flex w-full items-center gap-3 rounded-xl border p-3 text-left
-        transition
-        ${
-          highlighted
-            ? "border-red-100 bg-red-50/50 hover:border-red-200 hover:bg-red-50"
-            : "border-slate-200 hover:border-red-200 hover:bg-red-50/40"
-        }
-      `}
-    >
-      <div
-        className={`
-          flex h-10 w-10 shrink-0 items-center justify-center rounded-lg
-          ${highlighted ? "bg-red-100" : "bg-slate-100 group-hover:bg-red-50"}
-        `}
-      >
-        <Icon
-          size={19}
-          className={
-            highlighted
-              ? "text-red-700"
-              : "text-slate-600 group-hover:text-red-700"
-          }
-        />
-      </div>
-
-      <div className="min-w-0 flex-1">
-        <p className="text-sm font-medium text-slate-700">{title}</p>
-
-        <p className="mt-0.5 truncate text-xs text-slate-400">{description}</p>
-      </div>
-
-      <ArrowRight
-        size={16}
-        className="shrink-0 text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-red-600"
-      />
-    </button>
-  );
-}
-
-/* =============================================================
-   EMPTY DOCUMENTS
-============================================================= */
-
-function EmptyDocuments() {
-  return (
-    <div className="px-3 py-10 text-center">
-      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100">
-        <FileText size={21} className="text-slate-400" />
-      </div>
-
-      <p className="mt-3 text-sm font-medium text-slate-700">
-        No documents yet
-      </p>
-
-      <p className="mx-auto mt-1 max-w-xs text-xs leading-5 text-slate-400">
-        Upload a PDF to build your enterprise AI knowledge base.
-      </p>
-    </div>
-  );
-}
-
-/* =============================================================
-   WORKFLOW STEP
-============================================================= */
-
-function WorkflowStep({ number, title, description }) {
-  return (
-    <div className="rounded-xl border border-slate-100 bg-slate-50 p-4 transition hover:border-red-100 hover:bg-red-50/30">
-      <span className="text-[10px] font-bold tracking-wider text-red-700">
-        {number}
-      </span>
-
-      <h3 className="mt-2 text-sm font-semibold text-slate-700">{title}</h3>
-
-      <p className="mt-1 text-xs leading-5 text-slate-400">{description}</p>
-    </div>
-  );
-}
-
-src/layouts/MainLayout.jsx
-import { useState } from "react";
-import Header from "../components/Header";
-import Sidebar from "../components/Sidebar";
-export default function MainLayout({ children }) {
-  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const openMobileSidebar = () => {
-    setMobileSidebarOpen(true);
-  };
-  const closeMobileSidebar = () => {
-    setMobileSidebarOpen(false);
-  };
-  return (
-    <div className="flex h-screen overflow-hidden bg-slate-100">
-      {/* Sidebar */}
-      <Sidebar mobileOpen={mobileSidebarOpen} onClose={closeMobileSidebar} />
-      {/* Main application */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        {/* Header */}
-        <Header onMenuClick={openMobileSidebar} />
-        {/* Content */}
-        <main className="min-h-0 flex-1 overflow-y-auto">
-          <div className="min-h-full w-full">{children}</div>
-        </main>
-      </div>
-    </div>
-  );
-}
-
-backend/app.py
-from fastapi.openapi.utils import get_openapi
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
-from typing import Annotated
-from fastapi.middleware.cors import CORSMiddleware
-
-import shutil
-import os
-import time
+services/vector_store.py
+import json
 import logging
-import uuid
+import threading
+import re
+import math
 from pathlib import Path
+from collections import Counter
 
-from services.pdf_service import extract_text
-from models.question import QuestionRequest
-from services.vector_store import vector_store
-from services.gemini_service import ask_gemini
-from services.document_manager import document_manager
+import faiss
+import numpy as np
 
-from routers.auth import router as auth_router
+from services.embedding_service import embedding_service
 
-app = FastAPI()
-app.include_router(auth_router)
 logger = logging.getLogger("uvicorn.error")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+BASE_DIR = Path(__file__).resolve().parent.parent
+INDEX_DIR = BASE_DIR / "indexes"
 
-BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_FOLDER = BASE_DIR / "uploads"
-UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+FAISS_INDEX_FILE = INDEX_DIR / "faiss.index"
+METADATA_FILE = INDEX_DIR / "faiss_metadata.json"
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start_time = time.time()
-    logger.info(
-        "Request started: %s %s",
-        request.method,
-        request.url.path,
+import re
+
+def calculate_signature_score(text):
+    if not text:
+        return 0.0
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    # ---------------------------------------------------------
+    # Find positions of important signature markers
+    # ---------------------------------------------------------
+    behalf_matches = list(
+        re.finditer(
+            r"\bfor\s+and\s+on\s+behalf\s+of\b",
+            normalized
+        )
     )
-    
-    response = await call_next(request)
-    duration_ms = (time.time() - start_time) * 1000
-
-    logger.info(
-        "Request completed: %s %s -> %s (%.2f ms)",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration_ms,
+    signature_matches = list(
+        re.finditer(
+            r"\bsignature\s*:",
+            normalized
+        )
     )
-
-    return response
-
-@app.get("/")
-def home():
-    return {
-        "message": "PDF RAG Backend Running"
-    }
-
-@app.post("/upload")
-async def upload_files(files: Annotated[list[UploadFile], File(...)]):
-    logger.info(
-        "Multiple upload request received. Files: %s",
-        len(files),
+    name_matches = list(
+        re.finditer(
+            r"\bname\s*:",
+            normalized
+        )
     )
+    title_matches = list(
+        re.finditer(
+            r"\btitle\s*:",
+            normalized
+        )
+    )
+    # ---------------------------------------------------------
+    # Actual signature block
+    # ---------------------------------------------------------
+    for behalf in behalf_matches:
+        behalf_pos = behalf.start()
+        nearby_signature = any(
+            abs(m.start() - behalf_pos) <= 500
+            for m in signature_matches
+        )
+        nearby_name = any(
+            abs(m.start() - behalf_pos) <= 500
+            for m in name_matches
+        )
+        nearby_title = any(
+            abs(m.start() - behalf_pos) <= 500
+            for m in title_matches
+        )
+        # Strongest evidence
+        if nearby_signature and nearby_name:
+            return 1.0
+        if nearby_name and nearby_title:
+            return 0.9
+        if nearby_signature:
+            return 0.75
+        if nearby_name:
+            return 0.7
+    # ---------------------------------------------------------
+    # Signed / delivered block
+    # ---------------------------------------------------------
+    if re.search(
+        r"\bsigned\s+sealed\s+and\s+delivered\b",
+        normalized
+    ):
+        if name_matches and signature_matches:
+            return 0.95
+        if name_matches:
+            return 0.85
+    # ---------------------------------------------------------
+    # Authorized signatory
+    # ---------------------------------------------------------
+    if re.search(
+        r"\bauthori[sz]ed\s+signatory\b",
+        normalized
+    ):
+        if name_matches or signature_matches:
+            return 0.85
+        return 0.6
+    # ---------------------------------------------------------
+    # Signed by + name
+    # ---------------------------------------------------------
+    if re.search(r"\bsigned\s+by\b", normalized):
+        if name_matches:
+            return 0.8
+        return 0.5
+    # ---------------------------------------------------------
+    # Electronic signature metadata
+    # ---------------------------------------------------------
+    if re.search(r"\besign\s+by\s+signdesk\b", normalized):
+        if signature_matches:
+            return 0.6
+        return 0.3
+    # ---------------------------------------------------------
+    # Generic signature fields
+    # ---------------------------------------------------------
+    if signature_matches and name_matches:
+        return 0.5
+    if signature_matches:
+        return 0.2
+    return 0.0
 
-    uploaded_documents = []
-    failed_documents = []
+class FAISSVectorStore:
 
-    for file in files:
-        original_filename = Path(file.filename or "uploaded_file.pdf").name
+    def __init__(self):
+        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.lock = threading.Lock()
+
+        self.dimension = (
+            embedding_service.model.get_embedding_dimension()
+        )
+
+        self.index = None
+        self.metadata = {}
+        self.next_vector_id = 1
+
+        self._load()
+
+    # ============================================================
+    # FAISS LOAD
+    # ============================================================
+
+    def _load(self):
+        """
+        Load the FAISS index and metadata from disk.
+        """
+
+        if FAISS_INDEX_FILE.exists():
+
+            logger.info(
+                "Loading FAISS index from disk: %s",
+                FAISS_INDEX_FILE
+            )
+
+            self.index = faiss.read_index(
+                str(FAISS_INDEX_FILE)
+            )
+
+        else:
+
+            logger.info(
+                "Creating a new FAISS index. Dimension: %s",
+                self.dimension
+            )
+
+            base_index = faiss.IndexFlatIP(
+                self.dimension
+            )
+
+            self.index = faiss.IndexIDMap2(
+                base_index
+            )
+
+        if METADATA_FILE.exists():
+
+            try:
+
+                with open(
+                    METADATA_FILE,
+                    "r",
+                    encoding="utf-8"
+                ) as file:
+
+                    data = json.load(file)
+
+                self.metadata = data.get(
+                    "metadata",
+                    {}
+                )
+
+                self.next_vector_id = data.get(
+                    "next_vector_id",
+                    1
+                )
+
+            except Exception as exc:
+
+                logger.error(
+                    "Failed to load FAISS metadata: %s",
+                    exc
+                )
+
+                self.metadata = {}
+                self.next_vector_id = 1
 
         logger.info(
-            "Processing uploaded file: %s",
-            original_filename,
+            "FAISS vector count: %s",
+            self.index.ntotal
         )
 
-        try:
-            # Create a unique physical filename.
-            unique_id = uuid.uuid4().hex
-            stored_filename = (
-                f"{unique_id}_{original_filename}"
+        logger.info(
+            "FAISS metadata entries: %s",
+            len(self.metadata)
+        )
+
+    # ============================================================
+    # SAVE
+    # ============================================================
+
+    def _save(self):
+        """
+        Persist FAISS index and metadata to disk.
+        """
+
+        temp_index_file = (
+            FAISS_INDEX_FILE.with_suffix(".tmp")
+        )
+
+        faiss.write_index(
+            self.index,
+            str(temp_index_file)
+        )
+
+        temp_index_file.replace(
+            FAISS_INDEX_FILE
+        )
+
+        data = {
+            "next_vector_id": self.next_vector_id,
+            "metadata": self.metadata
+        }
+
+        temp_metadata_file = (
+            METADATA_FILE.with_suffix(".tmp")
+        )
+
+        with open(
+            temp_metadata_file,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                data,
+                file,
+                indent=2,
+                ensure_ascii=False
             )
 
-            file_path = UPLOAD_FOLDER / stored_filename
+        temp_metadata_file.replace(
+            METADATA_FILE
+        )
 
-            logger.info(
-                "Saving physical file: %s",
-                file_path,
+    # ============================================================
+    # ADD DOCUMENT
+    # ============================================================
+
+    def add_document(
+        self,
+        document_id,
+        filename,
+        chunks
+    ):
+        """
+        Add a document's chunks to the FAISS index.
+        """
+
+        if not chunks:
+            return 0
+
+        cleaned_chunks = [
+            chunk.strip()
+            for chunk in chunks
+            if chunk and chunk.strip()
+        ]
+
+        if not cleaned_chunks:
+            return 0
+
+        logger.info(
+            "Creating embedding for document: %s",
+            filename
+        )
+
+        embeddings = (
+            embedding_service.embed_documents(
+                cleaned_chunks
             )
+        )
 
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+        vectors = np.asarray(
+            embeddings,
+            dtype="float32"
+        )
 
-            file_size = os.path.getsize(file_path)
+        vector_ids = []
+        metadata_entries = {}
 
-            logger.info(
-                "File saved successfully: %s (%s bytes)",
-                original_filename,
-                file_size,
-            )
+        with self.lock:
 
-            # Extract text and create chunks.
-            result = extract_text(str(file_path))
+            for index, chunk in enumerate(
+                cleaned_chunks
+            ):
 
-            text = result["text"]
-            chunks = result["chunks"]
+                vector_id = self.next_vector_id
+                self.next_vector_id += 1
 
-            logger.info(
-                "Text extraction completed: %s | Characters: %s | Chunks: %s",
-                original_filename,
-                len(text),
-                len(chunks),
-            )
-
-            if not chunks:
-                raise ValueError(
-                    "No text chunks could be extracted from the PDF."
+                vector_ids.append(
+                    vector_id
                 )
 
-            # Create document metadata.
-            document = document_manager.add_document(
-                filename=original_filename,
-                filesize=file_size,
-                stored_filename=stored_filename,
+                metadata_entries[
+                    str(vector_id)
+                ] = {
+                    "document_id": document_id,
+                    "filename": filename,
+                    "chunk_index": index,
+                    "text": chunk
+                }
+
+            ids = np.asarray(
+                vector_ids,
+                dtype="int64"
             )
 
-            # Add chunks to FAISS.
-            faiss_chunks_added = vector_store.add_document(
-                document_id=document["id"],
-                filename=original_filename,
-                chunks=chunks,
+            self.index.add_with_ids(
+                vectors,
+                ids
             )
 
-            logger.info(
-                "FAISS indexing completed for %s: %s chunks added",
-                original_filename,
-                faiss_chunks_added,
+            self.metadata.update(
+                metadata_entries
             )
 
-            uploaded_documents.append(
+            self._save()
+
+        logger.info(
+            "Added %s chunks to FAISS for document %s",
+            len(cleaned_chunks),
+            document_id
+        )
+
+        logger.info(
+            "Total vectors in FAISS: %s",
+            self.index.ntotal
+        )
+
+        return len(cleaned_chunks)
+
+    # ============================================================
+    # TOKENIZER
+    # ============================================================
+
+    def _tokenize(self, text):
+        """
+        Simple tokenizer for lexical search.
+        """
+
+        if not text:
+            return []
+
+        return re.findall(
+            r"\b[a-zA-Z0-9]+\b",
+            text.lower()
+        )
+
+    # ============================================================
+    # LEXICAL SEARCH
+    # ============================================================
+
+    def _lexical_search(
+        self,
+        query,
+        top_k=15
+    ):
+        """
+        Lightweight BM25-style lexical search.
+
+        Useful for:
+        - names
+        - clause numbers
+        - dates
+        - exact terminology
+        - agreement names
+        """
+
+        query_tokens = self._tokenize(
+            query
+        )
+
+        if not query_tokens:
+            return []
+
+        documents = []
+
+        for vector_id, metadata in self.metadata.items():
+
+            tokens = self._tokenize(
+                metadata.get("text", "")
+            )
+
+            if tokens:
+
+                documents.append(
+                    (
+                        int(vector_id),
+                        tokens
+                    )
+                )
+
+        if not documents:
+            return []
+
+        total_documents = len(
+            documents
+        )
+
+        document_frequency = Counter()
+
+        for _, tokens in documents:
+
+            for token in set(tokens):
+
+                document_frequency[token] += 1
+
+        average_length = (
+            sum(
+                len(tokens)
+                for _, tokens in documents
+            )
+            / total_documents
+        )
+
+        k1 = 1.5
+        b = 0.75
+
+        query_term_counts = Counter(
+            query_tokens
+        )
+
+        scored_documents = []
+
+        for vector_id, tokens in documents:
+
+            token_counts = Counter(
+                tokens
+            )
+
+            document_length = len(
+                tokens
+            )
+
+            score = 0.0
+
+            for term, query_count in (
+                query_term_counts.items()
+            ):
+
+                term_frequency = (
+                    token_counts.get(
+                        term,
+                        0
+                    )
+                )
+
+                if term_frequency == 0:
+                    continue
+
+                df = document_frequency.get(
+                    term,
+                    0
+                )
+
+                idf = math.log(
+                    1
+                    + (
+                        total_documents
+                        - df
+                        + 0.5
+                    )
+                    / (
+                        df
+                        + 0.5
+                    )
+                )
+
+                denominator = (
+                    term_frequency
+                    + k1
+                    * (
+                        1
+                        - b
+                        + b
+                        * (
+                            document_length
+                            / average_length
+                        )
+                    )
+                )
+
+                term_score = (
+                    idf
+                    * (
+                        (
+                            term_frequency
+                            * (k1 + 1)
+                        )
+                        / denominator
+                    )
+                )
+
+                score += (
+                    term_score
+                    * query_count
+                )
+
+            if score > 0:
+
+                metadata = self.metadata.get(
+                    str(vector_id)
+                )
+
+                if metadata:
+
+                    scored_documents.append(
+                        {
+                            "score": float(score),
+                            "vector_id": vector_id,
+                            "document_id": metadata[
+                                "document_id"
+                            ],
+                            "filename": metadata[
+                                "filename"
+                            ],
+                            "chunk_index": metadata[
+                                "chunk_index"
+                            ],
+                            "text": metadata[
+                                "text"
+                            ]
+                        }
+                    )
+
+        scored_documents.sort(
+            key=lambda x: x["score"],
+            reverse=True
+        )
+
+        return scored_documents[:top_k]
+
+    # ============================================================
+    # FAISS SEARCH
+    # ============================================================
+
+    def _semantic_search(
+        self,
+        query,
+        top_k=15
+    ):
+
+        query_embedding = (
+            embedding_service.embed_text(
+                query
+            )
+        )
+
+        query_vector = np.asarray(
+            [query_embedding],
+            dtype="float32"
+        )
+
+        scores, vector_ids = (
+            self.index.search(
+                query_vector,
+                top_k
+            )
+        )
+
+        results = []
+
+        for score, vector_id in zip(
+            scores[0],
+            vector_ids[0]
+        ):
+
+            if vector_id == -1:
+                continue
+
+            metadata = self.metadata.get(
+                str(int(vector_id))
+            )
+
+            if not metadata:
+                continue
+
+            results.append(
                 {
-                    "document": document,
-                    "characters": len(text),
-                    "chunks": len(chunks),
-                    "faiss_chunks_added": faiss_chunks_added,
-                    "preview": text[:500],
+                    "score": float(score),
+                    "vector_id": int(vector_id),
+                    "document_id": metadata[
+                        "document_id"
+                    ],
+                    "filename": metadata[
+                        "filename"
+                    ],
+                    "chunk_index": metadata[
+                        "chunk_index"
+                    ],
+                    "text": metadata[
+                        "text"
+                    ]
                 }
             )
 
-        except Exception as exc:
-            logger.exception(
-                "Failed to process file: %s",
-                original_filename,
+        return results
+
+    # ============================================================
+    # DOCUMENT / INTENT BOOSTING
+    # ============================================================
+    def _normalize_text(self, text):
+        if not text:
+            return ""
+        return re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            text.lower()
+        ).strip()
+
+    def _query_relevance_score(self, query, text):
+        """
+        Calculate lexical relevance between the user's query
+        and a retrieved chunk.
+        This is used as an additional signal to remove
+        semantically related but weakly relevant chunks.
+        """
+
+        query_tokens = self._tokenize(query)
+        text_tokens = self._tokenize(text)
+
+        if not query_tokens or not text_tokens:
+            return 0.0
+
+        # Common words which should not influence relevance.
+        stopwords = {
+            "what",
+            "is",
+            "are",
+            "was",
+            "were",
+            "the",
+            "a",
+            "an",
+            "of",
+            "for",
+            "to",
+            "in",
+            "on",
+            "and",
+            "or",
+            "with",
+            "from",
+            "by",
+            "how",
+            "much",
+            "can",
+            "could",
+            "would",
+            "should",
+            "please",
+            "tell",
+            "me",
+            "give",
+            "according",
+        }
+
+        query_terms = [
+            token
+            for token in query_tokens
+            if token not in stopwords
+            and len(token) > 2
+        ]
+
+        if not query_terms:
+            return 0.0
+
+        text_token_set = set(text_tokens)
+
+        matched_terms = sum(
+            1
+            for term in query_terms
+            if term in text_token_set
+        )
+        
+        coverage = matched_terms / len(query_terms)
+
+        # Exact phrase bonus.
+        normalized_query = " ".join(query_terms)
+        normalized_text = " ".join(text_tokens)
+
+        phrase_bonus = 0.0
+
+        if normalized_query and normalized_query in normalized_text:
+            phrase_bonus = 0.30
+
+        return min(
+            1.0,
+            coverage + phrase_bonus
+        )
+
+    def _document_hint_score(self, query, filename):
+        """
+        Detect whether the query explicitly refers to
+        a document/file name.
+        """
+        query_text = self._normalize_text(query)
+        file_text = self._normalize_text(
+            Path(filename).stem
+        )
+
+        if not query_text or not file_text:
+            return 0.0
+        query_tokens = set(
+            query_text.split()
+        )
+        file_tokens = set(
+            file_text.split()
+        )
+        if not file_tokens:
+            return 0.0
+        overlap = (
+            query_tokens.intersection(
+                file_tokens
+            )
+        )
+        return (
+            len(overlap)
+            / len(file_tokens)
+        )
+    def _intent_score(self, query, text):
+        """
+        Boost chunks that match the intent of the question.
+        """
+        query_text = self._normalize_text(
+            query
+        )
+        chunk_text = self._normalize_text(
+            text
+        )
+        if not query_text or not chunk_text:
+            return 0.0
+        # --------------------------------------------------------
+        # Signatory / signature questions
+        # --------------------------------------------------------
+        signatory_terms = [
+            "signatory",
+            "signatories",
+            "signature",
+            "signatures",
+            "signed",
+            "esign",
+            "e sign",
+            "authorized signatory",
+            "authorised signatory",
+            "witness whereof",
+        ]
+        if any(
+            term in query_text
+            for term in signatory_terms
+        ):
+            matching_terms = 0
+            for term in signatory_terms:
+                if term in chunk_text:
+                    matching_terms += 1
+            if matching_terms:
+                return min(
+                    1.0,
+                    0.25
+                    * matching_terms
+                )
+        return 0.0
+
+    def _signature_score(self, query, text):
+        """
+        Detect chunks that are likely to contain
+        actual agreement signatories.
+        """
+        query_text = self._normalize_text(query)
+        chunk_text = self._normalize_text(text)
+        if not query_text or not chunk_text:
+            return 0.0
+        signatory_query_terms = [
+            "signatory",
+            "signatories",
+            "who signed",
+            "signed by",
+            "signature",
+            "signatures",
+        ]
+        is_signature_question = any(
+            term in query_text
+            for term in signatory_query_terms
+        )
+        if not is_signature_question:
+            return 0.0
+        score = 0.0
+        # --------------------------------------------------------
+        # Strong signature indicators
+        # --------------------------------------------------------
+        signature_indicators = [
+            "esign by signdesk",
+            "electronic signature",
+            "electronic signing",
+            "signed",
+            "signature",
+            "signatory",
+            "authorized signatory",
+            "authorised signatory",
+            "in witness whereof",
+        ]
+        indicator_count = sum(
+            1
+            for term in signature_indicators
+            if term in chunk_text
+        )
+        score += min(
+            0.60,
+            indicator_count * 0.15
+        )
+        # --------------------------------------------------------
+        # Person-name pattern
+        #
+        # OCR commonly produces:
+        #
+        # Rakesh Sen Rakesh Sen
+        # Rampraveen Swaminathan
+        #
+        # We give a modest bonus to chunks containing
+        # multiple capitalized-name-like patterns.
+        # --------------------------------------------------------
+        import re
+        name_matches = re.findall(
+            r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b",
+            text
+        )
+        unique_names = set(
+            name.strip()
+            for name in name_matches
+        )
+        if len(unique_names) >= 2:
+            score += 0.40
+        elif len(unique_names) == 1:
+            score += 0.20
+        return min(
+            1.0,
+            score
+        )
+
+    # ============================================================
+    # HYBRID SEARCH
+    # ============================================================
+    def search(
+        self,
+        query,
+        top_k=5
+    ):
+        """
+        Improved hybrid retrieval.
+        Pipeline:
+        1. FAISS semantic retrieval
+        2. BM25-style lexical retrieval
+        3. Reciprocal Rank Fusion
+        4. Query relevance scoring
+        5. Intent/document/signature boosting
+        6. Weak-result filtering
+        7. Final top-K results
+        """
+
+        if not query or not query.strip():
+            return []
+        if self.index.ntotal == 0:
+            return []
+
+        # ============================================================
+        # 1. RETRIEVE MORE CANDIDATES
+        # ============================================================
+        semantic_results = self._semantic_search(
+            query,
+            top_k=20
+        )
+
+        lexical_results = self._lexical_search(
+            query,
+            top_k=20
+        )
+
+        # ============================================================
+        # 2. RECIPROCAL RANK FUSION
+        # ============================================================
+        fusion_scores = {}
+        result_lookup = {}
+
+        rrf_k = 60
+
+        # ------------------------------------------------------------
+        # Semantic results
+        # ------------------------------------------------------------
+        for rank, result in enumerate(
+            semantic_results,
+            start=1
+        ):
+            vector_id = result["vector_id"]
+            fusion_scores.setdefault(
+                vector_id,
+                0.0
+            )
+            fusion_scores[vector_id] += (
+                1.0 / (rrf_k + rank)
+            )
+            result_lookup[vector_id] = dict(
+                result
+            )
+            result_lookup[vector_id][
+                "semantic_score"
+            ] = float(
+                result.get(
+                    "score",
+                    0.0
+                )
             )
 
-            # Remove physical file if processing failed.
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-            except Exception:
-                logger.exception(
-                    "Failed to remove incomplete file: %s",
-                    original_filename,
+        # ------------------------------------------------------------
+        # ------------------------------------------------------------
+        # Lexical results
+        # ------------------------------------------------------------
+        for rank, result in enumerate(
+            lexical_results,
+            start=1
+        ):
+            vector_id = result["vector_id"]
+            fusion_scores.setdefault(
+                vector_id,
+                0.0
+            )
+            fusion_scores[vector_id] += (
+                1.0 / (rrf_k + rank)
+            )
+
+            if vector_id not in result_lookup:
+                result_lookup[vector_id] = dict(
+                    result
+                )
+                result_lookup[vector_id][
+                    "semantic_score"
+                ] = 0.0
+
+            result_lookup[vector_id][
+                "lexical_score"
+            ] = float(
+                result.get(
+                    "score",
+                    0.0
+                )
+            )
+   
+        # ============================================================
+        # 3. BUILD CANDIDATES
+        # ============================================================
+        ranked_results = []
+
+        for vector_id, fusion_score in (
+            fusion_scores.items()
+        ):
+            result = dict(
+                result_lookup[vector_id]
+            )
+            result["fusion_score"] = float(
+                fusion_score
+            )
+            result.setdefault(
+                "semantic_score",
+                0.0
+            )
+            result.setdefault(
+                "lexical_score",
+                0.0
+            )
+
+            # ========================================================
+            # QUERY RELEVANCE
+            # ========================================================
+            relevance_score = (
+                self._query_relevance_score(
+                    query,
+                    result["text"]
+                )
+            )
+
+            # ========================================================
+            # DOCUMENT NAME SCORE
+            # ========================================================
+            document_score = (
+                self._document_hint_score(
+                    query,
+                    result["filename"]
+                )
+            )
+
+            # ========================================================
+            # INTENT SCORE
+            # ========================================================
+            intent_score = (
+                self._intent_score(
+                    query,
+                    result["text"]
+                )
+            )
+
+            # ========================================================
+            # SIGNATURE SCORE
+            # ========================================================
+            signature_score = (
+                calculate_signature_score(
+                    result["text"]
+                )
+            )
+
+            result["relevance_score"] = float(
+                relevance_score
+            )
+            result["document_score"] = float(
+                document_score
+            )
+            result["intent_score"] = float(
+                intent_score
+            )
+            result["signature_score"] = float(
+                signature_score
+            )
+
+            # ========================================================
+            # FINAL SCORE
+            # ========================================================
+            result["final_score"] = (
+                result["fusion_score"]
+                + (
+                    relevance_score
+                    * 0.08
+                )
+                + (
+                    document_score
+                    * 0.05
+                )
+                + (
+                    intent_score
+                    * 0.02
+                )
+                + (
+                    signature_score
+                    * 0.03
+                )
+            )
+            ranked_results.append(
+                result
+            )
+
+        # ============================================================
+        # 4. SORT
+        # ============================================================
+        ranked_results.sort(
+            key=lambda x: x["final_score"],
+            reverse=True
+        )
+
+        # ============================================================
+        # 5. FILTER WEAK RESULTS
+        # ============================================================
+        filtered_results = []
+
+        for result in ranked_results:
+            relevance = result.get(
+                "relevance_score",
+                0.0
+            )
+            semantic = result.get(
+                "semantic_score",
+                0.0
+            )
+            lexical = result.get(
+                "lexical_score",
+                0.0
+            )
+
+            # --------------------------------------------------------
+            # Strong lexical match
+            # --------------------------------------------------------
+            if relevance >= 0.50:
+                filtered_results.append(
+                    result
+                )
+                continue
+
+            # --------------------------------------------------------
+            # Strong semantic result
+            #
+            # Keep semantic-only results because the user may
+            # paraphrase the wording used in the document.
+            # --------------------------------------------------------
+            if semantic >= 0.55:
+                filtered_results.append(
+                    result
+                )
+                continue
+
+            # --------------------------------------------------------
+            # Strong lexical score
+            # --------------------------------------------------------
+            if lexical > 1.0:
+                filtered_results.append(
+                    result
+                )
+                continue
+
+            # --------------------------------------------------------
+            # Otherwise reject weak candidate
+            # --------------------------------------------------------
+            logger.debug(
+                "Filtered weak RAG result: %s | "
+                "chunk=%s | relevance=%.3f | semantic=%.3f | lexical=%.3f",
+                result["filename"],
+                result["chunk_index"],
+                relevance,
+                semantic,
+                lexical,
+            )
+
+        # ============================================================
+        # 6. FALLBACK
+        # ============================================================
+        if not filtered_results:
+            logger.warning(
+                "No results passed relevance filtering. "
+                "Returning strongest semantic candidates."
+            )
+            filtered_results = ranked_results[:top_k]
+
+        # ============================================================
+        # 7. FINAL TOP K
+        # ============================================================
+        final_results = filtered_results[:top_k]
+
+        # ============================================================
+        # 8. LOGGING
+        # ============================================================
+        logger.info(
+            "Improved hybrid search: "
+            "semantic=%s lexical=%s candidates=%s final=%s",
+            len(semantic_results),
+            len(lexical_results),
+            len(ranked_results),
+            len(final_results)
+        )
+
+        for rank, result in enumerate(
+            final_results,
+            start=1
+        ):
+            logger.info(
+                "RANK=%s FILE=%s CHUNK=%s "
+                "FINAL=%.6f FUSION=%.6f "
+                "SEMANTIC=%.6f LEXICAL=%.6f "
+                "RELEVANCE=%.3f DOC=%.3f "
+                "INTENT=%.3f SIGNATURE=%.3f",
+
+                rank,
+                result["filename"],
+                result["chunk_index"],
+                result["final_score"],
+                result["fusion_score"],
+                result["semantic_score"],
+                result["lexical_score"],
+                result["relevance_score"],
+                result["document_score"],
+                result["intent_score"],
+                result["signature_score"],
+            )
+        return final_results
+
+    # ============================================================
+    # DELETE DOCUMENT
+    # ============================================================
+
+    def delete_document(
+        self,
+        document_id
+    ):
+
+        vector_ids = []
+
+        for vector_id, metadata in (
+            self.metadata.items()
+        ):
+
+            if metadata.get(
+                "document_id"
+            ) == document_id:
+
+                vector_ids.append(
+                    int(vector_id)
                 )
 
-            failed_documents.append(
-                {
-                    "filename": original_filename,
-                    "error": str(exc),
-                }
-            )
-    logger.info(
-        "Multiple upload completed. Success: %s | Failed: %s",
-        len(uploaded_documents),
-        len(failed_documents),
-    )
+        if not vector_ids:
 
-    return {
-        "message": "Upload processing completed.",
-        "total_files": len(files),
-        "successful_files": len(uploaded_documents),
-        "failed_files": len(failed_documents),
-        "documents": uploaded_documents,
-        "failures": failed_documents,
-    }
-
-@app.post("/ask")
-async def ask_question(request: QuestionRequest):
-    logger.info(
-        "Received question: %s",
-        request.question,
-    )
-
-    results = vector_store.search(
-        query=request.question,
-        top_k=8,
-    )
-
-    if not results:
-        return {
-            "question": request.question,
-            "answer": "Please upload PDF first.",
-        }
-
-    logger.info(
-        "FAISS returned %s relevant chunks for question: %s",
-        len(results),
-        request.question,
-    )
-
-    context_parts = []
-
-    for result in results:
-        context_parts.append(
-            f"Document: {result['filename']}\n"
-            f"Chunk: {result['chunk_index']}\n"
-            f"Content:\n{result['text']}"
-        )
-
-    context = "\n\n---\n\n".join(context_parts)
-
-    answer = ask_gemini(
-        context,
-        request.question,
-    )
-
-    return {
-        "question": request.question,
-        "answer": answer,
-    }
-
-@app.get("/documents")
-def list_documents():
-    documents = document_manager.get_documents()
-    return {
-        "total_documents": len(documents),
-        "documents": documents,
-    }
-
-@app.delete("/documents/{document_id}")
-def delete_document(document_id: str):
-
-    logger.info(
-        "Delete request received for document: %s",
-        document_id,
-    )
-
-    document = document_manager.delete_document(
-        document_id
-    )
-
-    if document is None:
-        logger.warning(
-            "Document not found for deletion: %s",
-            document_id,
-        )
-
-        return {
-            "success": False,
-            "message": "Document not found.",
-        }
-
-    filename = document["filename"]
-
-    stored_filename = document.get(
-        "stored_filename",
-        filename,
-    )
-
-    logger.info(
-        "Deleting RAG document: %s -> %s",
-        filename,
-        document_id,
-    )
-
-    # Remove vectors from FAISS.
-    faiss_deleted = vector_store.delete_document(
-        document_id
-    )   
-
-    logger.info(
-        "FAISS vectors removed for document %s: %s",
-        document_id,
-        faiss_deleted,
-    )
-
-    # Remove physical PDF.
-    file_path = UPLOAD_FOLDER / stored_filename
-
-    if file_path.exists():
-        try:
-            file_path.unlink()
             logger.info(
-                "Physical PDF deleted: %s",
-                file_path,
+                "No FAISS vectors found for document: %s",
+                document_id
             )
 
-        except Exception as exc:
-            logger.error(
-                "Could not delete physical PDF %s: %s",
-                file_path,
-                exc,
+            return 0
+
+        with self.lock:
+
+            ids = np.asarray(
+                vector_ids,
+                dtype="int64"
             )
-    else:
-        logger.warning(
-            "Physical PDF not found: %s",
-            file_path,
+
+            removed = (
+                self.index.remove_ids(
+                    ids
+                )
+            )
+
+            for vector_id in vector_ids:
+
+                self.metadata.pop(
+                    str(vector_id),
+                    None
+                )
+
+            self._save()
+
+        logger.info(
+            "Removed %s vectors for document: %s",
+            removed,
+            document_id
         )
 
-    return {
-        "success": True,
-        "message": "Document deleted successfully.",
-        "document": document,
-        "faiss_vectors_deleted": faiss_deleted,
-    }
+        logger.info(
+            "Total vectors in FAISS after deletion: %s",
+            self.index.ntotal
+        )
 
-@app.get("/auth/sso")
-async def sso_login():
-    raise HTTPException(
-        status_code=501,
-        detail="SSO login not implemented yet. Please use the demo login.",
-    )
+        return int(removed)
 
-def custom_openapi():
-   if app.openapi_schema:
-       return app.openapi_schema
-   schema = get_openapi(
-       title=app.title,
-       version="1.0.0",
-       description="PDF RAG Backend API",
-       routes=app.routes,
-   )
-   components = schema.get("components", {}).get("schemas", {})
-   for component in components.values():
-       properties = component.get("properties", {})
-       for prop in properties.values():
-           # Array of uploaded files
-           if (
-               prop.get("type") == "array"
-               and isinstance(prop.get("items"), dict)
-           ):
-               items = prop["items"]
-               if items.get("contentMediaType") == "application/octet-stream":
-                   items.pop("contentMediaType", None)
-                   items["type"] = "string"
-                   items["format"] = "binary"
-           # Single uploaded file
-           elif (
-               prop.get("type") == "string"
-               and prop.get("contentMediaType") == "application/octet-stream"
-           ):
-               prop.pop("contentMediaType", None)
-               prop["format"] = "binary"
-   app.openapi_schema = schema
-   return app.openapi_schema
+    # ============================================================
+    # DOCUMENT VECTOR COUNT
+    # ============================================================
 
-app.openapi = custom_openapi
+    def get_document_vector_count(
+        self,
+        document_id
+    ):
+
+        count = 0
+
+        for metadata in (
+            self.metadata.values()
+        ):
+
+            if metadata.get(
+                "document_id"
+            ) == document_id:
+
+                count += 1
+
+        return count
+
+    # ============================================================
+    # TOTAL VECTOR COUNT
+    # ============================================================
+
+    def get_total_vector_count(self):
+
+        return self.index.ntotal
+
+
+vector_store = FAISSVectorStore()
