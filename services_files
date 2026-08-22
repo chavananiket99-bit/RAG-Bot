@@ -1,70 +1,232 @@
-//services/embedding_service.py
+//services/document_manager.py
+import json
+import uuid
 from pathlib import Path
-import logging
-
-from sentence_transformers import SentenceTransformer
-
-logger = logging.getLogger("uvicorn.error")
+from datetime import datetime
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-MODEL_PATH = BASE_DIR / "models" / "all-MiniLM-L6-v2"
 
-class EmbeddingService:
+METADATA_DIR = BASE_DIR / "metadata"
+METADATA_FILE = METADATA_DIR / "documents.json"
+
+class DocumentManager:
     def __init__(self):
-        logger.info("Loading embedding model: %s", MODEL_PATH)
+        METADATA_DIR.mkdir(exist_ok=True)
 
-        if not MODEL_PATH.exists():
-            raise FileNotFoundError(f"Embedding model not found at {MODEL_PATH}")
+        if not METADATA_FILE.exists():
+            METADATA_FILE.write_text("[]", encoding='utf-8')
 
-        self.model = SentenceTransformer(str(MODEL_PATH), local_files_only=True)
-        logger.info("Embedding model loaded successfully.")
-        logger.info("Embedding model dimension: %s", self.model.get_sentence_embedding_dimension())
+    def get_documents(self):
+        with open(METADATA_FILE, 'r', encoding='utf-8') as file:
+            return json.load(file)
 
-    def embed_documents(self, texts):
+    def save_documents(self, documents):
+        with open(METADATA_FILE, "w", encoding='utf-8') as file:
+            json.dump(documents, file, indent=4, ensure_ascii=False,)
 
-        if not texts:
-            return[]
+    def add_document(self, filename, filesize, stored_filename=None):
+        documents = self.get_documents()
 
-        embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        document = {
+            "id": str(uuid.uuid4()),
+            "filename": filename,
+            "stored_filename": stored_filename or filename,
+            "filesize": filesize,
+            "uploaded_at": datetime.now().isoformat(),
+            "status": "Indexed"
+        }
 
-        return embeddings.tolist()
-
-    def embed_text(self, text):
-        if not text or not text.strip():
-            return []
+        documents.append(document)
+        self.save_documents(documents)
         
-        embedding = self.model.encode(text, normalize_embeddings=True, show_progress_bar=False)
-    
-        return embedding.tolist()
+        return document
 
-embedding_service = EmbeddingService()
+    def delete_document(self, document_id):
+        documents = self.get_documents()
+        document_to_delete = None
 
-//services/chunk_service.py
-import logging
+        for document in documents:
+            if document.get("id") == document_id:
+                document_to_delete = document
+                break
 
-logger = logging.getLogger("uvicorn.error")
+        if document_to_delete is None:
+            return None
 
-def split_text(text, chunk_size=1000, overlap=200):
-    """
-    Split text into overlapping chunks.
-    """
+        documents = [
+            document for document in documents if document.get("id") != document_id
+        ]
 
-    if not text.strip():
-        return[]
+        self.save_documents(documents)
+        return document_to_delete
 
-    chunks = []
-    start = 0
-    text_length = len(text)
+document_manager = DocumentManager()
 
-    while start < text_length:
-        end = min(start + chunk_size, text_length)
-        chunks.append(text[start:end])
 
-        start += chunk_size - overlap
+//src/components/UploadedDocuments.jsx
+import { useState } from "react";
+import {
+  FileText,
+  X,
+  Files,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+} from "lucide-react";
+import { useUpload } from "../context/UploadContext";
+import { deleteDocument } from "../services/api";
 
-    logger.info("Total chunks created: %s", len(chunks))
+export default function UploadedDocuments() {
+  const { uploadedFiles, refreshDocuments } = useUpload();
+  const [deletingId, setDeletingId] = useState(null);
+  const [deleteError, setDeleteError] = useState("");
 
-    for index, chunk in enumerate(chunks):
-        logger.info("--- Chunk %s ---", index + 1, len(chunk))
-        
-    return chunks
+  const removeFile = async (document) => {
+    if (!document?.id) {
+      setDeleteError(
+        "This document cannot be removed because its document ID is missing.",
+      );
+      return;
+    }
+    if (deletingId) {
+      return;
+    }
+    setDeleteError("");
+    setDeletingId(document.id);
+    try {
+      await deleteDocument(document.id);
+      /*
+       * Backend is the source of truth.
+       * Reload the document list instead of manually
+       * removing the item from React state.
+       */
+      await refreshDocuments();
+    } catch (error) {
+      console.error("Document deletion failed:", error);
+      setDeleteError(
+        error?.response?.data?.detail ||
+          error?.message ||
+          "Unable to delete the document. Please try again.",
+      );
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  if (!uploadedFiles || uploadedFiles.length === 0) {
+    return null;
+  }
+  return (
+    <section className="border-b border-slate-200 bg-white">
+      {/* =====================================================
+         HEADER
+     ====================================================== */}
+      <div className="flex flex-col gap-3 px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-red-50">
+            <Files size={19} className="text-red-700" />
+          </div>
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold text-slate-800">
+              Knowledge Documents
+            </h2>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Documents available to the AI assistant
+            </p>
+          </div>
+        </div>
+        <div className="flex w-fit items-center gap-2 rounded-full bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-600">
+          <span>
+            {uploadedFiles.length}{" "}
+            {uploadedFiles.length === 1 ? "document" : "documents"}
+          </span>
+        </div>
+      </div>
+      {/* =====================================================
+         DELETE ERROR
+     ====================================================== */}
+      {deleteError && (
+        <div className="mx-6 mb-3 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700">
+          <AlertCircle size={15} className="mt-0.5 shrink-0" />
+          <span>{deleteError}</span>
+          <button
+            type="button"
+            onClick={() => setDeleteError("")}
+            className="ml-auto shrink-0 rounded-md p-0.5 text-red-400 transition hover:bg-red-100 hover:text-red-700"
+            aria-label="Dismiss error"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+      {/* =====================================================
+         DOCUMENT STRIP
+     ====================================================== */}
+      <div className="flex gap-3 overflow-x-auto px-6 pb-5">
+        {uploadedFiles.map((file, index) => {
+          const filename =
+            file?.filename || file?.name || `Document ${index + 1}`;
+          const isDeleting = deletingId === file?.id;
+          return (
+            <div
+              key={file?.id || file?.filename || file?.name || index}
+              className={`group relative flex min-w-[250px] max-w-[300px] items-center gap-3 rounded-xl border bg-white px-3.5 py-3 transition ${
+                isDeleting
+                  ? "border-red-200 bg-red-50/40 opacity-70"
+                  : "border-slate-200 hover:border-red-200 hover:bg-red-50/20 hover:shadow-sm"
+              }`}
+            >
+              {/* =================================================
+                 DOCUMENT ICON
+             ================================================== */}
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-red-50">
+                <FileText size={20} className="text-red-700" />
+              </div>
+              {/* =================================================
+                 DOCUMENT INFORMATION
+             ================================================== */}
+              <div className="min-w-0 flex-1">
+                <p
+                  className="truncate text-sm font-medium text-slate-700"
+                  title={filename}
+                >
+                  {filename}
+                </p>
+                <div className="mt-1 flex items-center gap-1.5">
+                  <CheckCircle2
+                    size={12}
+                    className="shrink-0 text-emerald-500"
+                  />
+                  <p className="truncate text-[11px] text-slate-400">
+                    {file?.status || "Indexed"}
+                  </p>
+                </div>
+              </div>
+              {/* =================================================
+                 DELETE BUTTON
+             ================================================== */}
+              <button
+                type="button"
+                onClick={() => removeFile(file)}
+                disabled={Boolean(deletingId)}
+                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
+                  isDeleting
+                    ? "cursor-wait bg-red-50 text-red-600"
+                    : "text-slate-400 opacity-0 hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
+                } disabled:cursor-not-allowed`}
+                title={isDeleting ? "Removing document..." : "Remove document"}
+                aria-label={`Remove ${filename}`}
+              >
+                {isDeleting ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : (
+                  <X size={16} />
+                )}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
