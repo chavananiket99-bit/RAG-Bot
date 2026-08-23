@@ -206,6 +206,63 @@ async def ask_question(request: QuestionRequest):
         top_k=5,
     )
 
+    # ============================================================
+    # SIGNATURE QUESTION DOCUMENT FILTERING
+    # ============================================================
+    signature_keywords = [
+        "signatory",
+        "signatories",
+        "signature",
+        "signatures",
+        "signed",
+        "signed by",
+        "who signed",
+        "authorized signatory",
+        "authorised signatory",
+        "esign",
+        "e sign",
+    ]
+    normalized_question = request.question.lower()
+
+    is_signature_question = any(
+        keyword in normalized_question
+        for keyword in signature_keywords
+    )
+
+    if is_signature_question:
+        signature_results = [
+            result
+            for result in results
+            if result.get("signature_score", 0.0) > 0
+            and result.get("document_score", 0.0) > 0
+        ]
+
+        if signature_results:
+            selected = signature_results[:2]
+
+            selected_ids = {
+                result["vector_id"]
+                for result in selected
+            }
+
+            for result in results:
+                if len(selected) >= 4:
+                    break
+
+                if result["vector_id"] in selected_ids:
+                    continue
+
+                if result.get("document_score", 0.0) > 0:
+                    selected.append(result)
+
+            results = selected
+
+            logger.info(
+                "Signature-question filtering applied. "
+                "Remaining results: %s",
+                len(results),
+            )
+
     if not results:
         return {
             "question": request.question,
@@ -223,12 +280,23 @@ async def ask_question(request: QuestionRequest):
 
     for result in results:
         context_parts.append(
-            f"Document: {result['filename']}\n"
-            f"Chunk: {result['chunk_index']}\n"
-            f"Content:\n{result['text']}"
+            f"""
+    DOCUMENT:
+    {result['filename']}
+    CHUNK:
+    {result['chunk_index']}
+    RETRIEVAL RELEVANCE:
+    {result.get('relevance_score', 0.0):.3f}
+    SIGNATURE RELEVANCE:
+    {result.get('signature_score', 0.0):.3f}
+    CONTENT:
+    {result['text']}
+    """
         )
 
-    context = "\n\n---\n\n".join(context_parts)
+    context = "\n\n====================\n\n".join(
+        context_parts
+    )
 
     answer = ask_gemini(
         context,
@@ -380,254 +448,3 @@ def custom_openapi():
    return app.openapi_schema
 
 app.openapi = custom_openapi
-
-//test_faiss.py
-from services.vector_store import vector_store
-
-print("\n========== FAISS TEST ==========\n")
-# 1. Test adding a document
-document_id = "test-document-001"
-filename = "test.pdf"
-chunks = [
-   "Mahindra is an Indian multinational automotive manufacturing company.",
-   "The company manufactures automobiles, commercial vehicles and tractors.",
-   "Mahindra was founded in 1945.",
-]
-print("Adding test document...")
-added = vector_store.add_document(
-   document_id=document_id,
-   filename=filename,
-   chunks=chunks,
-)
-print(f"Chunks added: {added}")
-
-# 2. Check total vectors
-total_vectors = vector_store.get_total_vector_count()
-print(f"Total vectors in FAISS: {total_vectors}")
-
-# 3. Test similarity search
-query = "When was Mahindra founded?"
-print(f"\nSearching for: {query}")
-results = vector_store.search(
-   query=query,
-   top_k=3,
-)
-
-# 4. Display results
-print("\n========== SEARCH RESULTS ==========\n")
-for index, result in enumerate(results, start=1):
-   print(f"Result {index}")
-   print(f"Score: {result['score']:.4f}")
-   print(f"Filename: {result['filename']}")
-   print(f"Chunk index: {result['chunk_index']}")
-   print(f"Text: {result['text']}")
-   print("-" * 60)
-
-# 5. Delete test document
-print("\nDeleting test document...")
-deleted = vector_store.delete_document(document_id)
-print(f"Vectors deleted: {deleted}")
-print(
-   f"Total vectors after deletion: "
-   f"{vector_store.get_total_vector_count()}"
-)
-print("\n========== FAISS TEST COMPLETE ==========\n")
-
-//services/faiss_service.py
-import json
-import logging
-from pathlib import Path
-
-import faiss
-import numpy as np
-
-logger = logging.getLogger("uvicorn.error")
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-INDEX_DIR = BASE_DIR / "indexes"
-
-INDEX_FILE = INDEX_DIR / "documents.index"
-METADATA_FILE = INDEX_DIR / "documents_metadata.json"
-
-class FAISSService:
-    def __init__(self):
-        INDEX_DIR.mkdir(parents=True, exist_ok=True)
-
-        self.index = None
-        self.metadata = []
-
-        self._load()
-
-    def _load(self):
-        """
-        Load the FAISS index and metadata from disk.
-        """
-
-        if INDEX_FILE.exists() and METADATA_FILE.exists():
-            try:
-                self.index = faiss.read_index(str(INDEX_FILE))
-
-                with open(METADATA_FILE, "r", encoding="utf-8") as file:
-                    self.metadata = json.load(file)
-
-                logger.info("FAISS index loaded: %s vectors", self.index.ntotal,)
-
-            except Exception as exc:
-                logger.error("Failed to load FAISS index: %s", exc,)
-                self.index = None
-                self.metadata = []
-
-    def _save(self):
-        """
-        Persist FAISS index and metadata to disk.
-        """
-
-        if self.index is not None:
-            faiss.write_index(self.index, str(INDEX_FILE))
-
-            with open(METADATA_FILE, "w", encoding="utf-8") as file:
-                json.dump(self.metadata, file, indent=4, ensure_ascii=False,)
-
-    def initialize(self, dimension):
-        """
-        Create an empty FAISS index.
-
-        We use IndexFlatIP because embeddings will be normalized, making inner product equivalent to cosine similarity.
-        """
-
-        if self.index is None:
-            self.index = faiss.IndexFlatIP(dimension)
-            self.metadata = []
-
-            self._save()
-
-            logger.info("Create new FAISS index with dimension %s", dimension)
-
-    def add_embeddings(self, embeddings, document_id, filename, chunks,):
-        """
-        Add document chunk embeddings to the FAISS.
-
-        Each embedding is associated with metadata containing the document ID, filename, and chunk text.
-        """
-
-        if not embeddings:
-            return
-
-        vectors = np.asarray(embeddings, dtype="float32")
-
-        if vectors.ndim != 2:
-            raise ValueError("Embeddings must be a 2-dimensional array")
-
-        faiss.normalize_L2(vectors)
-
-        dimension = vectors.shape[1]
-
-        self.initialize(dimension)
-
-        if self.index.d != dimension:
-            raise ValueError(
-                f"Embedding dimension mismatch. "
-                f"Existing index: {self.index.d}, "
-                f"New embeddings: {dimension}"
-            )
-
-        self.index.add(vectors)
-
-        start_index = len(self.metadata)
-
-        for chunk_index, chunk in enumerate(chunks):
-            self.metadata.append(
-                {
-                    "vector_id": start_index + chunk_index,
-                    "document_id": document_id,
-                    "filename": filename,
-                    "chunk_index": chunk_index,
-                    "text": chunk,
-                }
-            )
-
-        self._save()
-
-        logger.info(
-            "Added %s chunks for document %s", len(chunks), document_id
-        )
-
-    def search(self, query_embedding, top_k=5):
-        """"
-        Search the most relevant chunks
-        """
-
-        if self.index is None or self.index.ntotal == 0:
-            return []
-
-        query_vector = np.asarray([query_embedding], dtype="float32")
-
-        faiss.normalize_L2(query_vector)
-
-        k = min(top_k, self.index.ntotal)
-
-        scores, indices = self.index.search(query_vector, k)
-
-        results = []
-
-        for score, index in zip(scores[0], indices[0]):
-            if index < 0:
-                continue
-
-            if index >= len(self.metadata):
-                continue
-
-            metadata = self.metadata[index].copy()
-
-            metadata["score"] = float(score)
-
-            results.append(metadata)
-
-        return results
-
-faiss_service = FAISSService()
-
-//services/gemini_service.py
-import google.generativeai as genai
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# print("API Key:", GEMINI_API_KEY)
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-model = genai.GenerativeModel("gemini-3.5-flash")
-
-def ask_gemini(context, question):
-   prompt = f"""
-You are an enterprise document question-answering assistant.
-Your task is to answer the user's question using ONLY the
-information contained in the provided document context.
-IMPORTANT RULES:
-1. Do not use outside knowledge.
-2. Do not guess or infer facts that are not supported by the context.
-3. If multiple documents are provided, use only the documents
-  that contain information relevant to the question.
-4. Ignore irrelevant document chunks.
-5. If the context does not contain enough information to answer
-  the question, reply exactly:
-"I couldn't find that information in the uploaded document."
-6. When the answer contains a number, amount, date, name,
-  percentage, or other specific value, preserve the value
-  exactly as supported by the document.
-7. Give a concise and direct answer.
-8. Do not mention retrieval, embeddings, FAISS, BM25, RRF,
-  chunks, or internal implementation details.
-DOCUMENT CONTEXT:
-{context}
-USER QUESTION:
-{question}
-ANSWER:
-"""
-   response = model.generate_content(
-       prompt
-   )
-   return response.text
