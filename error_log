@@ -1,0 +1,99 @@
+import google.generativeai as genai
+INFO:     Started server process [10012]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Request started: POST /ask
+INFO:     Received question: Who signed the Nagpur LP WH agreement?
+INFO:     Explicit document detection: query='Who signed the Nagpur LP WH agreement?' -> ['Nagpur  LP WH agreement 2024-2027.pdf']
+INFO:     Target document(s) detected: ['Nagpur  LP WH agreement 2024-2027.pdf']
+INFO:     DEBUG NAGPUR: FILE=Nagpur  LP WH agreement 2024-2027.pdf CHUNK=6 FINAL=0.403294 FUSION=0.014925 SEMANTIC=0.296758 LEXICAL=0.000000 RELEVANCE=0.100 DOC=0.667 DOC_BOOST=0.150 INTENT=0.750 SIGNATURE=0.850
+INFO:     DEBUG NAGPUR: FILE=Nagpur  LP WH agreement 2024-2027.pdf CHUNK=5 FINAL=0.346885 FUSION=0.014706 SEMANTIC=0.291131 LEXICAL=0.000000 RELEVANCE=0.000 DOC=0.667 DOC_BOOST=0.150 INTENT=0.000 SIGNATURE=0.000
+INFO:     DEBUG NAGPUR: FILE=Nagpur  LP WH agreement 2024-2027.pdf CHUNK=0 FINAL=0.364689 FUSION=0.014493 SEMANTIC=0.287525 LEXICAL=0.000000 RELEVANCE=0.100 DOC=0.667 DOC_BOOST=0.150 INTENT=0.000 SIGNATURE=0.000
+INFO:     DEBUG NAGPUR: FILE=Nagpur  LP WH agreement 2024-2027.pdf CHUNK=2 FINAL=0.191974 FUSION=0.013158 SEMANTIC=0.000000 LEXICAL=4.146491 RELEVANCE=0.100 DOC=0.667 DOC_BOOST=0.150 INTENT=0.000 SIGNATURE=0.000
+INFO:     DEBUG NAGPUR: FILE=Nagpur  LP WH agreement 2024-2027.pdf CHUNK=3 FINAL=0.191899 FUSION=0.012658 SEMANTIC=0.000000 LEXICAL=4.096507 RELEVANCE=0.100 DOC=0.667 DOC_BOOST=0.150 INTENT=0.000 SIGNATURE=0.000
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1151, in emit
+    msg = self.format(record)
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 999, in format
+    return fmt.format(record)
+           ~~~~~~~~~~^^^^^^^^
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 712, in format
+    record.message = record.getMessage()
+                     ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 400, in getMessage
+    msg = msg % self.args
+          ~~~~^~~~~~~~~~~
+TypeError: not all arguments converted during string formatting
+Call stack:
+  File "<string>", line 1, in <module>
+    from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=404, pipe_handle=828)
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\multiprocessing\spawn.py", line 122, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\multiprocessing\spawn.py", line 135, in _main
+    return self._bootstrap(parent_sentinel)
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\multiprocessing\process.py", line 313, in _bootstrap
+    self.run()
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\multiprocessing\process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\uvicorn\_subprocess.py", line 80, in subprocess_started
+    target(sockets=sockets)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\uvicorn\server.py", line 74, in run
+    return asyncio_run(self.serve(sockets=sockets), loop_factory=self.config.get_loop_factory())
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 712, in run_until_complete
+    self.run_forever()
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 683, in run_forever
+    self._run_once()
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 2050, in _run_once
+    handle._run()
+  File "C:\Users\s03714\AppData\Local\Programs\Python\Python313\Lib\asyncio\events.py", line 89, in _run
+    self._context.run(self._callback, *self._args)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\anyio\_core\_tasks.py", line 275, in _run_coro
+    retval = await self._coro
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\starlette\middleware\base.py", line 144, in coro
+    await self.app(scope, receive_or_disconnect, send_no_error)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\starlette\middleware\cors.py", line 96, in __call__
+    await self.simple_response(scope, receive, send, request_headers=headers)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\starlette\middleware\cors.py", line 154, in simple_response
+    await self.app(scope, receive, send)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\fastapi\middleware\asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\starlette\routing.py", line 660, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\fastapi\routing.py", line 2689, in app
+    await route.handle(scope, receive, send)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\fastapi\routing.py", line 1272, in handle
+    await super().handle(scope, receive, send)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\starlette\routing.py", line 276, in handle
+    await self.app(scope, receive, send)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\fastapi\routing.py", line 156, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\fastapi\routing.py", line 142, in app
+    response = await f(request)
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\fastapi\routing.py", line 698, in app
+    raw_response = await run_endpoint_function(
+  File "D:\Office_Python\pdf-rag-bot280726\.venv\Lib\site-packages\fastapi\routing.py", line 350, in run_endpoint_function
+    return await dependant.call(**values)
+  File "D:\Office_Python\pdf-rag-bot280726\backend\app.py", line 203, in ask_question
+    results = vector_store.search(
+  File "D:\Office_Python\pdf-rag-bot280726\backend\services\vector_store.py", line 1716, in search
+    logger.info(
+Message: 'Explicit document filtering applied. '
+Arguments: ('Allowed documents: %s', ['Nagpur  LP WH agreement 2024-2027.pdf'])
+INFO:     Improved hybrid search: semantic=20 lexical=20 candidates=5 final=2
+INFO:     RANK=1 FILE=Nagpur  LP WH agreement 2024-2027.pdf CHUNK=6 FINAL=0.403294 FUSION=0.014925 SEMANTIC=0.296758 LEXICAL=0.000000 RELEVANCE=0.100 DOC=0.667 DOC_BOOST=0.150 INTENT=0.750 SIGNATURE=0.850
+INFO:     RANK=2 FILE=Nagpur  LP WH agreement 2024-2027.pdf CHUNK=0 FINAL=0.364689 FUSION=0.014493 SEMANTIC=0.287525 LEXICAL=0.000000 RELEVANCE=0.100 DOC=0.667 DOC_BOOST=0.150 INTENT=0.000 SIGNATURE=0.000
+INFO:     Signature-question filtering applied. Remaining results: 2
+INFO:     FAISS returned 2 relevant chunks for question: Who signed the Nagpur LP WH agreement?
+INFO:     Request completed: POST /ask -> 200 (8918.12 ms)
+INFO:     127.0.0.1:50977 - "POST /ask HTTP/1.1" 200 OK
