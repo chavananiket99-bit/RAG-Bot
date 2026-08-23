@@ -240,18 +240,6 @@ async def ask_question(request: QuestionRequest):
     for result in results:
         sources.append(
             {
-                "filename": result["filename"],
-                "chunk_index": result["chunk_index"],
-                "document_id": result["document_id"],
-                "score": round(result.get("final_score", 0.0), 6),
-            }
-        )
-
-    sources = []
-
-    for result in results:
-        sources.append(
-            {
                 "document_id": result.get("document_id"),
                 "filename": result.get("filename"),
                 "chunk_index": result.get("chunk_index"),
@@ -393,211 +381,253 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-//src/api.js
-import axios from "axios";
+//test_faiss.py
+from services.vector_store import vector_store
 
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+print("\n========== FAISS TEST ==========\n")
+# 1. Test adding a document
+document_id = "test-document-001"
+filename = "test.pdf"
+chunks = [
+   "Mahindra is an Indian multinational automotive manufacturing company.",
+   "The company manufactures automobiles, commercial vehicles and tractors.",
+   "Mahindra was founded in 1945.",
+]
+print("Adding test document...")
+added = vector_store.add_document(
+   document_id=document_id,
+   filename=filename,
+   chunks=chunks,
+)
+print(f"Chunks added: {added}")
 
-const api = axios.create({
-  baseURL: API_BASE_URL,
-  timeout: 120000,
-});
+# 2. Check total vectors
+total_vectors = vector_store.get_total_vector_count()
+print(f"Total vectors in FAISS: {total_vectors}")
 
-export async function uploadPdf(files) {
-  const formData = new FormData();
+# 3. Test similarity search
+query = "When was Mahindra founded?"
+print(f"\nSearching for: {query}")
+results = vector_store.search(
+   query=query,
+   top_k=3,
+)
 
-  Array.from(files).forEach((file) => {
-    formData.append("files", file);
-  });
+# 4. Display results
+print("\n========== SEARCH RESULTS ==========\n")
+for index, result in enumerate(results, start=1):
+   print(f"Result {index}")
+   print(f"Score: {result['score']:.4f}")
+   print(f"Filename: {result['filename']}")
+   print(f"Chunk index: {result['chunk_index']}")
+   print(f"Text: {result['text']}")
+   print("-" * 60)
 
-  const response = await api.post("/upload", formData);
+# 5. Delete test document
+print("\nDeleting test document...")
+deleted = vector_store.delete_document(document_id)
+print(f"Vectors deleted: {deleted}")
+print(
+   f"Total vectors after deletion: "
+   f"{vector_store.get_total_vector_count()}"
+)
+print("\n========== FAISS TEST COMPLETE ==========\n")
 
-  return response.data;
-}
+//services/faiss_service.py
+import json
+import logging
+from pathlib import Path
 
-export async function getDocuments() {
-  const response = await api.get("/documents");
-  return response.data;
-}
+import faiss
+import numpy as np
 
-export async function askQuestion(question) {
-  const response = await api.post("/ask", { question });
+logger = logging.getLogger("uvicorn.error")
 
-  return response.data;
-}
+BASE_DIR = Path(__file__).resolve().parent.parent
+INDEX_DIR = BASE_DIR / "indexes"
 
-export { API_BASE_URL };
+INDEX_FILE = INDEX_DIR / "documents.index"
+METADATA_FILE = INDEX_DIR / "documents_metadata.json"
 
-export async function deleteDocument(documentId) {
-  const response = await api.delete(`/documents/${documentId}`);
+class FAISSService:
+    def __init__(self):
+        INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
-  return response.data;
-}
+        self.index = None
+        self.metadata = []
 
-//pages/chat.jsx
-import { askQuestion } from "../services/api";
-import { useUpload } from "../context/UploadContext";
-import ChatWindow from "../components/ChatWindow";
-import ChatInput from "../components/ChatInput";
-import UploadedDocuments from "../components/UploadedDocuments";
-export default function Chat() {
-  const { messages, setMessages, typing, setTyping } = useUpload();
-  const handleSend = async (text) => {
-    if (!text?.trim() || typing) return;
-    setMessages((prev) => [
-      ...prev,
-      {
-        role: "user",
-        content: text.trim(),
-      },
-    ]);
-    setTyping(true);
-    try {
-      const response = await askQuestion(text.trim());
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: response.answer,
-          sources: response.sources || [],
-        },
-      ]);
-    } catch (error) {
-      console.error("AI request failed:", error);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content:
-            "Sorry, there was an error processing your request. Please try again.",
-        },
-      ]);
-    } finally {
-      setTyping(false);
-    }
-  };
-  return (
-    <div className="flex h-full min-h-0 flex-col bg-slate-50">
-      {/* Knowledge documents */}
-      <UploadedDocuments />
-      {/* Chat workspace */}
-      <ChatWindow messages={messages} typing={typing} />
-      {/* Input */}
-      <ChatInput onSend={handleSend} disabled={typing} />
-    </div>
-  );
-}
+        self._load()
 
-//components/chatwindow.jsx
-import { useEffect, useRef } from "react";
-import {
-  Bot,
-  FileSearch,
-  Sparkles,
-  ShieldCheck,
-  MessageSquare,
-} from "lucide-react";
-import MessageBubble from "./MessageBubble";
-export default function ChatWindow({ messages, typing }) {
-  const bottomRef = useRef(null);
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({
-      behavior: "smooth",
-    });
-  }, [messages, typing]);
-  const hasMessages = messages && messages.length > 0;
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50">
-      {!hasMessages ? (
-        <div className="flex min-h-full items-center justify-center px-4 py-10 sm:px-6">
-          <div className="w-full max-w-3xl">
-            {/* Hero */}
-            <div className="text-center">
-              <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-red-50 shadow-sm">
-                <Bot size={32} className="text-red-700" />
-              </div>
-              <h1 className="mt-5 text-2xl font-semibold tracking-tight text-slate-800 sm:text-3xl">
-                Enterprise AI Assistant
-              </h1>
-              <p className="mx-auto mt-3 max-w-xl text-sm leading-6 text-slate-500">
-                Ask questions about your uploaded documents and get answers
-                grounded in your enterprise knowledge base.
-              </p>
-            </div>
-            {/* Capability cards */}
-            <div className="mt-8 grid gap-3 sm:grid-cols-3">
-              <CapabilityCard
-                icon={<FileSearch size={19} />}
-                title="Document Search"
-                description="Find relevant information across your uploaded documents."
-              />
-              <CapabilityCard
-                icon={<MessageSquare size={19} />}
-                title="Natural Questions"
-                description="Ask questions using normal business language."
-              />
-              <CapabilityCard
-                icon={<ShieldCheck size={19} />}
-                title="Knowledge Grounded"
-                description="Answers are generated using your document knowledge."
-              />
-            </div>
-            {/* Prompt hint */}
-            <div className="mt-8 flex items-center justify-center gap-2 text-xs text-slate-400">
-              <Sparkles size={14} className="text-red-500" />
-              <span>
-                Start by asking a question about your uploaded documents.
-              </span>
-            </div>
-          </div>
-        </div>
-      ) : (
-        <div className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
-          <div className="space-y-6">
-            {messages.map((message, index) => (
-              <MessageBubble
-                key={`${message.role}-${index}`}
-                sender={message.role}
-                text={message.content}
-                sources={message.sources || []}
-              />
-            ))}
-            {typing && (
-              <div className="flex items-start gap-3">
-                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-red-50">
-                  <Bot size={18} className="text-red-700" />
-                </div>
-                <div className="rounded-2xl rounded-tl-md border border-slate-200 bg-white px-4 py-3 shadow-sm">
-                  <div className="flex items-center gap-1.5">
-                    <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400" />
-                    <span
-                      className="h-2 w-2 animate-bounce rounded-full bg-slate-400"
-                      style={{ animationDelay: "150ms" }}
-                    />
-                    <span
-                      className="h-2 w-2 animate-bounce rounded-full bg-slate-400"
-                      style={{ animationDelay: "300ms" }}
-                    />
-                  </div>
-                </div>
-              </div>
-            )}
-            <div ref={bottomRef} />
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-function CapabilityCard({ icon, title, description }) {
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md">
-      <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-red-50 text-red-700">
-        {icon}
-      </div>
-      <p className="mt-3 text-sm font-semibold text-slate-700">{title}</p>
-      <p className="mt-1 text-xs leading-5 text-slate-500">{description}</p>
-    </div>
-  );
-}
+    def _load(self):
+        """
+        Load the FAISS index and metadata from disk.
+        """
+
+        if INDEX_FILE.exists() and METADATA_FILE.exists():
+            try:
+                self.index = faiss.read_index(str(INDEX_FILE))
+
+                with open(METADATA_FILE, "r", encoding="utf-8") as file:
+                    self.metadata = json.load(file)
+
+                logger.info("FAISS index loaded: %s vectors", self.index.ntotal,)
+
+            except Exception as exc:
+                logger.error("Failed to load FAISS index: %s", exc,)
+                self.index = None
+                self.metadata = []
+
+    def _save(self):
+        """
+        Persist FAISS index and metadata to disk.
+        """
+
+        if self.index is not None:
+            faiss.write_index(self.index, str(INDEX_FILE))
+
+            with open(METADATA_FILE, "w", encoding="utf-8") as file:
+                json.dump(self.metadata, file, indent=4, ensure_ascii=False,)
+
+    def initialize(self, dimension):
+        """
+        Create an empty FAISS index.
+
+        We use IndexFlatIP because embeddings will be normalized, making inner product equivalent to cosine similarity.
+        """
+
+        if self.index is None:
+            self.index = faiss.IndexFlatIP(dimension)
+            self.metadata = []
+
+            self._save()
+
+            logger.info("Create new FAISS index with dimension %s", dimension)
+
+    def add_embeddings(self, embeddings, document_id, filename, chunks,):
+        """
+        Add document chunk embeddings to the FAISS.
+
+        Each embedding is associated with metadata containing the document ID, filename, and chunk text.
+        """
+
+        if not embeddings:
+            return
+
+        vectors = np.asarray(embeddings, dtype="float32")
+
+        if vectors.ndim != 2:
+            raise ValueError("Embeddings must be a 2-dimensional array")
+
+        faiss.normalize_L2(vectors)
+
+        dimension = vectors.shape[1]
+
+        self.initialize(dimension)
+
+        if self.index.d != dimension:
+            raise ValueError(
+                f"Embedding dimension mismatch. "
+                f"Existing index: {self.index.d}, "
+                f"New embeddings: {dimension}"
+            )
+
+        self.index.add(vectors)
+
+        start_index = len(self.metadata)
+
+        for chunk_index, chunk in enumerate(chunks):
+            self.metadata.append(
+                {
+                    "vector_id": start_index + chunk_index,
+                    "document_id": document_id,
+                    "filename": filename,
+                    "chunk_index": chunk_index,
+                    "text": chunk,
+                }
+            )
+
+        self._save()
+
+        logger.info(
+            "Added %s chunks for document %s", len(chunks), document_id
+        )
+
+    def search(self, query_embedding, top_k=5):
+        """"
+        Search the most relevant chunks
+        """
+
+        if self.index is None or self.index.ntotal == 0:
+            return []
+
+        query_vector = np.asarray([query_embedding], dtype="float32")
+
+        faiss.normalize_L2(query_vector)
+
+        k = min(top_k, self.index.ntotal)
+
+        scores, indices = self.index.search(query_vector, k)
+
+        results = []
+
+        for score, index in zip(scores[0], indices[0]):
+            if index < 0:
+                continue
+
+            if index >= len(self.metadata):
+                continue
+
+            metadata = self.metadata[index].copy()
+
+            metadata["score"] = float(score)
+
+            results.append(metadata)
+
+        return results
+
+faiss_service = FAISSService()
+
+//services/gemini_service.py
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# print("API Key:", GEMINI_API_KEY)
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+model = genai.GenerativeModel("gemini-3.5-flash")
+
+def ask_gemini(context, question):
+   prompt = f"""
+You are an enterprise document question-answering assistant.
+Your task is to answer the user's question using ONLY the
+information contained in the provided document context.
+IMPORTANT RULES:
+1. Do not use outside knowledge.
+2. Do not guess or infer facts that are not supported by the context.
+3. If multiple documents are provided, use only the documents
+  that contain information relevant to the question.
+4. Ignore irrelevant document chunks.
+5. If the context does not contain enough information to answer
+  the question, reply exactly:
+"I couldn't find that information in the uploaded document."
+6. When the answer contains a number, amount, date, name,
+  percentage, or other specific value, preserve the value
+  exactly as supported by the document.
+7. Give a concise and direct answer.
+8. Do not mention retrieval, embeddings, FAISS, BM25, RRF,
+  chunks, or internal implementation details.
+DOCUMENT CONTEXT:
+{context}
+USER QUESTION:
+{question}
+ANSWER:
+"""
+   response = model.generate_content(
+       prompt
+   )
+   return response.text
