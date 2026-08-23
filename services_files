@@ -1,3 +1,4 @@
+//full vector_store.py file
 import json
 import logging
 import threading
@@ -984,6 +985,136 @@ class FAISSVectorStore:
             len(overlap)
             / len(file_tokens)
         )
+
+    def _detect_target_documents(self, query):
+        """
+        Detect documents explicitly referenced by the user query.
+        Example:
+            "Who signed the AD Inbound agreement?"
+                -> AD Inbound.pdf
+            "Who signed the Nagpur LP WH agreement?"
+                -> Nagpur LP WH agreement 2024-2027.pdf
+        Generic words such as agreement/document/file are ignored.
+        """
+        query_text = self._normalize_text(query)
+        if not query_text:
+            return set()
+       
+        query_tokens = set(query_text.split())
+        generic_filename_terms = {
+            "agreement",
+            "agreements",
+            "document",
+            "documents",
+            "file",
+            "files",
+            "pdf",
+            "contract",
+            "contracts",
+        }
+
+        query_tokens = {
+            token
+            for token in query_tokens
+            if token not in generic_filename_terms
+            and len(token) > 1
+        }
+
+        if not query_tokens:
+            return set()
+
+        document_scores = {}
+
+        # Group metadata by document.
+        documents = {}
+
+        for metadata in self.metadata.values():
+            filename = metadata.get(
+                "filename",
+                ""
+            )
+            if not filename:
+                continue
+            documents.setdefault(
+                filename,
+                set()
+            )
+            filename_tokens = self._normalize_text(
+                Path(filename).stem
+            ).split()
+
+            for token in filename_tokens:
+                if (
+                    token not in generic_filename_terms
+                    and len(token) > 1
+                ):
+                    documents[filename].add(token)
+
+        for filename, filename_tokens in documents.items():
+            if not filename_tokens:
+                continue
+            overlap = (
+                query_tokens.intersection(
+                    filename_tokens
+                )
+            )
+
+            overlap_count = len(overlap)
+
+            if overlap_count == 0:
+                continue
+
+            overlap_ratio = (
+                overlap_count
+                / len(filename_tokens)
+            )
+
+            query_coverage = (
+                overlap_count
+                / len(query_tokens)
+            )
+
+            # Strong document reference:
+            #
+            # AD + Inbound -> AD Inbound.pdf
+            # Nagpur + LP + WH -> Nagpur LP WH agreement...
+            if (
+                overlap_count >= 2
+                or overlap_ratio >= 0.50
+                or query_coverage >= 0.50
+            ):
+                document_scores[filename] = (
+                    overlap_count,
+                    overlap_ratio,
+                    query_coverage
+                )
+
+        if not document_scores:
+            return set()
+
+        # Find the strongest document match.
+        best_score = max(
+            document_scores.values(),
+            key=lambda value: (
+                value[0],
+                value[1],
+                value[2]
+            )
+        )
+
+        target_documents = {
+            filename
+            for filename, score in document_scores.items()
+            if score == best_score
+        }
+
+        logger.info(
+            "Explicit document detection: query='%s' -> %s",
+            query,
+            list(target_documents)
+        )
+        return target_documents
+
     def _intent_score(self, query, text):
         """
         Boost chunks that match the intent of the question.
@@ -1129,6 +1260,21 @@ class FAISSVectorStore:
             return []
 
         normalized_query = self._normalize_text(query)
+
+        # ============================================================
+        # EXPLICIT DOCUMENT DETECTION
+        # ============================================================
+        target_documents = self._detect_target_documents(
+            query
+        )
+        has_explicit_document = bool(
+            target_documents
+        )
+        if has_explicit_document:
+            logger.info(
+                "Target document(s) detected: %s",
+                list(target_documents)
+            )
         
         signature_query_terms = [
             "signatory",
@@ -1239,6 +1385,26 @@ class FAISSVectorStore:
         for vector_id, fusion_score in (
             fusion_scores.items()
         ):
+            result_metadata = result_lookup.get(
+                vector_id
+            )
+
+            if not result_metadata:
+                continue
+
+            if (
+                has_explicit_document
+                and result_metadata.get("filename")
+                not in target_documents
+            ):
+                logger.debug(
+                    "Exclude unrelated document: ",
+                    "%s | query=%s",
+                    result_metadata.get("filename"),
+                    query
+                )
+                continue
+
             result = dict(
                 result_lookup[vector_id]
             )
@@ -1280,6 +1446,10 @@ class FAISSVectorStore:
                 document_reference_boost = 0.15
             elif document_score >= 0.25:
                 document_reference_boost = 0.08
+
+            result["document_reference_boost"] = float(
+                document_reference_boost
+            )
 
             # ========================================================
             # INTENT SCORE
@@ -1543,6 +1713,13 @@ class FAISSVectorStore:
         # ============================================================
         # 8. LOGGING
         # ============================================================
+        if has_explicit_document:
+            logger.info(
+                "Explicit document filtering applied. "
+                "Allowed documents: %s",
+                list(target_documents)
+            )
+
         logger.info(
             "Improved hybrid search: "
             "semantic=%s lexical=%s candidates=%s final=%s",
