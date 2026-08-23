@@ -1432,39 +1432,16 @@ class FAISSVectorStore:
         # ============================================================
         # 7. DOCUMENT-DIVERSE FINAL RESULTS
         #
-        # Prevent one document from consuming all retrieval slots.
-        # The first result from each relevant document is preferred,
-        # followed by additional chunks from the strongest documents.
+        # Allow up to 2 chunks for the same document while
+        # preventing a single document from dominating the
+        # final RAG context.
         # ============================================================
-        final_results = []
-        seen_documents = set()
-
-        # First pass:
-        # Take the strongest result from each document.
-        for result in filtered_results:
-            document_id = result.get("document_id")
-            if document_id in seen_documents:
-                continue
-            final_results.append(result)
-            seen_documents.add(document_id)
-            if len(final_results) >= top_k:
-                break
-
-        # Second pass:
-        # If we still need more results, fill remaining slots
-        # using the strongest remaining chunks.
-        if len(final_results) < top_k:
-            selected_vector_ids = {
-                result.get("vector_id")
-                for result in final_results
-            }
-            for result in filtered_results:
-                if result.get("vector_id") in selected_vector_ids:
-                    continue
-                final_results.append(result)
-                if len(final_results) >= top_k:
-                    break
-
+        final_results = self._apply_document_diversity(
+            filtered_results,
+            top_k=top_k,
+            max_per_document=2
+        )
+        
         # ============================================================
         # 8. LOGGING
         # ============================================================
