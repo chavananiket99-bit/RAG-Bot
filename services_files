@@ -346,7 +346,8 @@ class FAISSVectorStore:
         self,
         document_id,
         filename,
-        chunks
+        chunks,
+        user_id=None,
     ):
         """
         Add a document's chunks to the FAISS index.
@@ -402,7 +403,8 @@ class FAISSVectorStore:
                     "document_id": document_id,
                     "filename": filename,
                     "chunk_index": index,
-                    "text": chunk
+                    "text": chunk,
+                    "user_id": user_id,
                 }
 
             ids = np.asarray(
@@ -513,7 +515,8 @@ class FAISSVectorStore:
     def _lexical_search(
         self,
         query,
-        top_k=15
+        top_k=15,
+        user_id=None,
     ):
         """
         Lightweight BM25-style lexical search.
@@ -536,6 +539,9 @@ class FAISSVectorStore:
         documents = []
 
         for vector_id, metadata in self.metadata.items():
+            if user_id is not None:
+                if metadata.get("user_id") != user_id:
+                    continue
 
             tokens = self._tokenize(
                 metadata.get("text", "")
@@ -697,7 +703,8 @@ class FAISSVectorStore:
     def _semantic_search(
         self,
         query,
-        top_k=15
+        top_k=15,
+        user_id=None,
     ):
 
         query_embedding = (
@@ -711,10 +718,15 @@ class FAISSVectorStore:
             dtype="float32"
         )
 
+        search_k = max(
+            top_k * 10, 
+            100
+        )
+
         scores, vector_ids = (
             self.index.search(
                 query_vector,
-                top_k
+                search_k
             )
         )
 
@@ -735,6 +747,10 @@ class FAISSVectorStore:
             if not metadata:
                 continue
 
+            if user_id is not None:
+                if metadata.get("user_id") != user_id:
+                    continue
+
             results.append(
                 {
                     "score": float(score),
@@ -752,6 +768,9 @@ class FAISSVectorStore:
                         "text"
                     ]
                 }
+
+                if len(results) >= top_k:
+                    break
             )
 
         return results
@@ -1158,7 +1177,7 @@ class FAISSVectorStore:
             score
         )
 
-    def _detect_target_documents(self, query):
+    def _detect_target_documents(self, query, user_id=None):
         """
         Detect documents explicitly referenced by the user query.
         
@@ -1240,6 +1259,10 @@ class FAISSVectorStore:
         documents = {}
 
         for metadata in self.metadata.values():
+            if user_id is not None:
+                if metadata.get("user_id") != user_id:
+                    continue
+
             filename = metadata.get(
                 "filename",
                 ""
@@ -1532,7 +1555,8 @@ class FAISSVectorStore:
     def search(
         self,
         query,
-        top_k=5
+        top_k=5,
+        user_id=None,
     ):
         """
         Improved hybrid retrieval.
@@ -1557,7 +1581,8 @@ class FAISSVectorStore:
         # EXPLICIT DOCUMENT DETECTION
         # ============================================================
         target_documents = self._detect_target_documents(
-            query
+            query,
+            user_id=user_id,
         )
         has_explicit_document = bool(
             target_documents
@@ -1592,12 +1617,14 @@ class FAISSVectorStore:
         # ============================================================
         semantic_results = self._semantic_search(
             query,
-            top_k=20
+            top_k=20,
+            user_id=user_id
         )
 
         lexical_results = self._lexical_search(
             query,
-            top_k=20
+            top_k=20,
+            user_id=user_id
         )
 
         # ============================================================
