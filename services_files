@@ -1,2123 +1,872 @@
-//backend / services / vector_store.py
-import json
+//AuthContext.jsx
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
+const AuthContext = createContext(null);
+const AUTH_STORAGE_KEY = "rag_auth";
+const AUTH_TOKEN_STORAGE_KEY = "rag_access_token";
+
+function loadStoredAuth() {
+  try {
+    const saved = localStorage.getItem(AUTH_STORAGE_KEY);
+    if (!saved) {
+      return null;
+    }
+    const parsed = JSON.parse(saved);
+    if (!parsed?.user || !parsed?.accessToken) {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+      return null;
+    }
+    return parsed;
+  } catch (error) {
+    console.error("Failed to restore authentication:", error);
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    return null;
+  }
+}
+export function AuthProvider({ children }) {
+  const [auth, setAuth] = useState(() => loadStoredAuth());
+  useEffect(() => {
+    if (auth) {
+      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(auth));
+    } else {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+    }
+  }, [auth]);
+  const login = async ({ username, password }) => {
+    if (!username?.trim() || !password) {
+      throw new Error("Username and password are required.");
+    }
+    const apiBaseUrl =
+      import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+    const response = await fetch(`${apiBaseUrl}/auth/login`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        username: username.trim(),
+        password,
+      }),
+    });
+    let data = {};
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+    if (!response.ok) {
+      throw new Error(
+        data?.detail ||
+          data?.message ||
+          "Unable to sign in. Please check your credentials.",
+      );
+    }
+    if (!data?.access_token || !data?.user) {
+      throw new Error("Authentication response is invalid.");
+    }
+    const authenticatedUser = data.user;
+    const authData = {
+      user: authenticatedUser,
+      accessToken: data.access_token,
+      tokenType: data.token_type || "bearer",
+    };
+    setAuth(authData);
+    return authenticatedUser;
+  };
+  const loginWithSSO = async () => {
+    throw new Error("Corporate SSO is not implemented yet.");
+  };
+  const logout = () => {
+    setAuth(null);
+  };
+  const value = useMemo(
+    () => ({
+      user: auth?.user || null,
+      accessToken: auth?.accessToken || null,
+      tokenType: auth?.tokenType || "bearer",
+      isAuthenticated: Boolean(auth?.user && auth?.accessToken),
+      login,
+      loginWithSSO,
+      logout,
+    }),
+    [auth],
+  );
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error("useAuth must be used within an AuthProvider");
+  }
+  return context;
+}
+
+//api.js
+import axios from "axios";
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+const api = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 120000,
+});
+api.interceptors.request.use(
+  (config) => {
+    try {
+      const savedAuth = localStorage.getItem("rag_auth");
+      if (savedAuth) {
+        const auth = JSON.parse(savedAuth);
+        if (auth?.accessToken) {
+          config.headers.Authorization = `Bearer ${auth.accessToken}`;
+        }
+      }
+    } catch (error) {
+      console.error("Failed to attach authentication token:", error);
+    }
+    return config;
+  },
+  (error) => Promise.reject(error),
+);
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 401) {
+      localStorage.removeItem("rag_auth");
+      window.location.href = "/login";
+    }
+    return Promise.reject(error);
+  },
+);
+export async function uploadPdf(files) {
+  const formData = new FormData();
+  Array.from(files).forEach((file) => {
+    formData.append("files", file);
+  });
+  const response = await api.post("/upload", formData);
+  return response.data;
+}
+export async function getDocuments() {
+  const response = await api.get("/documents");
+  return response.data;
+}
+export async function askQuestion(question) {
+  const response = await api.post("/ask", {
+    question,
+  });
+  return response.data;
+}
+export async function deleteDocument(documentId) {
+  const response = await api.delete(`/documents/${documentId}`);
+  return response.data;
+}
+export { API_BASE_URL };
+
+//app.py
+from fastapi.openapi.utils import get_openapi
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Depends
+from typing import Annotated
+from fastapi.middleware.cors import CORSMiddleware
+
+import shutil
+import os
+import time
 import logging
-import threading
-import re
-import math
+import uuid
 from pathlib import Path
-from collections import Counter
 
-import faiss
-import numpy as np
+from services.pdf_service import extract_text
+from models.question import QuestionRequest
+from services.vector_store import vector_store
+from services.gemini_service import ask_gemini
+from services.document_manager import document_manager
+from services.security import get_current_user
 
-from services.embedding_service import embedding_service
+from routers.auth import router as auth_router
 
+app = FastAPI()
+app.include_router(auth_router)
 logger = logging.getLogger("uvicorn.error")
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-INDEX_DIR = BASE_DIR / "indexes"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-FAISS_INDEX_FILE = INDEX_DIR / "faiss.index"
-METADATA_FILE = INDEX_DIR / "faiss_metadata.json"
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_FOLDER = BASE_DIR / "uploads"
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
 
-import re
-
-def calculate_signature_score(text):
-    if not text:
-        return 0.0
-    normalized = re.sub(r"\s+", " ", text).strip().lower()
-    # ---------------------------------------------------------
-    # Find positions of important signature markers
-    # ---------------------------------------------------------
-    behalf_matches = list(
-        re.finditer(
-            r"\bfor\s+and\s+on\s+behalf\s+of\b",
-            normalized
-        )
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    logger.info(
+        "Request started: %s %s",
+        request.method,
+        request.url.path,
     )
-    signature_matches = list(
-        re.finditer(
-            r"\bsignature\s*:",
-            normalized
-        )
+    
+    response = await call_next(request)
+    duration_ms = (time.time() - start_time) * 1000
+
+    logger.info(
+        "Request completed: %s %s -> %s (%.2f ms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
     )
-    name_matches = list(
-        re.finditer(
-            r"\bname\s*:",
-            normalized
-        )
+
+    return response
+
+@app.get("/")
+def home():
+    return {
+        "message": "PDF RAG Backend Running"
+    }
+
+@app.post("/upload")
+async def upload_files(files: Annotated[list[UploadFile], File(...)], current_user: dict = Depends(get_current_user),):
+    logger.info(
+        "Multiple upload request received. Files: %s",
+        len(files),
     )
-    title_matches = list(
-        re.finditer(
-            r"\btitle\s*:",
-            normalized
-        )
-    )
-    # ---------------------------------------------------------
-    # Actual signature block
-    # ---------------------------------------------------------
-    for behalf in behalf_matches:
-        behalf_pos = behalf.start()
-        nearby_signature = any(
-            abs(m.start() - behalf_pos) <= 500
-            for m in signature_matches
-        )
-        nearby_name = any(
-            abs(m.start() - behalf_pos) <= 500
-            for m in name_matches
-        )
-        nearby_title = any(
-            abs(m.start() - behalf_pos) <= 500
-            for m in title_matches
-        )
-        # Strongest evidence
-        if nearby_signature and nearby_name:
-            return 1.0
-        if nearby_name and nearby_title:
-            return 0.9
-        if nearby_signature:
-            return 0.75
-        if nearby_name:
-            return 0.7
-    # ---------------------------------------------------------
-    # Signed / delivered block
-    # ---------------------------------------------------------
-    if re.search(
-        r"\bsigned\s+sealed\s+and\s+delivered\b",
-        normalized
-    ):
-        if name_matches and signature_matches:
-            return 0.95
-        if name_matches:
-            return 0.85
-    # ---------------------------------------------------------
-    # Authorized signatory
-    # ---------------------------------------------------------
-    if re.search(
-        r"\bauthori[sz]ed\s+signatory\b",
-        normalized
-    ):
-        if name_matches or signature_matches:
-            return 0.85
-        return 0.6
-    # ---------------------------------------------------------
-    # Signed by + name
-    # ---------------------------------------------------------
-    if re.search(r"\bsigned\s+by\b", normalized):
-        if name_matches:
-            return 0.8
-        return 0.5
-    # ---------------------------------------------------------
-    # Electronic signature metadata
-    # ---------------------------------------------------------
-    if re.search(r"\besign\s+by\s+signdesk\b", normalized):
-        if signature_matches:
-            return 0.6
-        return 0.3
-    # ---------------------------------------------------------
-    # Generic signature fields
-    # ---------------------------------------------------------
-    if signature_matches and name_matches:
-        return 0.5
-    if signature_matches:
-        return 0.2
-    return 0.0
 
-class FAISSVectorStore:
+    uploaded_documents = []
+    failed_documents = []
 
-    def __init__(self):
-        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    for file in files:
+        original_filename = Path(file.filename or "uploaded_file.pdf").name
 
-        self.lock = threading.Lock()
-
-        self.dimension = (
-            embedding_service.model.get_embedding_dimension()
+        logger.info(
+            "Processing uploaded file: %s",
+            original_filename,
         )
 
-        self.index = None
-        self.metadata = {}
-        self.next_vector_id = 1
+        try:
+            # Create a unique physical filename.
+            unique_id = uuid.uuid4().hex
+            stored_filename = (
+                f"{unique_id}_{original_filename}"
+            )
 
-        self._load()
-
-    # ============================================================
-    # FAISS LOAD
-    # ============================================================
-
-    def _load(self):
-        """
-        Load the FAISS index and metadata from disk.
-        """
-
-        if FAISS_INDEX_FILE.exists():
+            file_path = UPLOAD_FOLDER / stored_filename
 
             logger.info(
-                "Loading FAISS index from disk: %s",
-                FAISS_INDEX_FILE
+                "Saving physical file: %s",
+                file_path,
             )
 
-            self.index = faiss.read_index(
-                str(FAISS_INDEX_FILE)
-            )
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
 
-        else:
+            file_size = os.path.getsize(file_path)
 
             logger.info(
-                "Creating a new FAISS index. Dimension: %s",
-                self.dimension
+                "File saved successfully: %s (%s bytes)",
+                original_filename,
+                file_size,
             )
 
-            base_index = faiss.IndexFlatIP(
-                self.dimension
+            # Extract text and create chunks.
+            result = extract_text(str(file_path))
+
+            text = result["text"]
+            chunks = result["chunks"]
+
+            logger.info(
+                "Text extraction completed: %s | Characters: %s | Chunks: %s",
+                original_filename,
+                len(text),
+                len(chunks),
             )
 
-            self.index = faiss.IndexIDMap2(
-                base_index
-            )
-
-        if METADATA_FILE.exists():
-
-            try:
-
-                with open(
-                    METADATA_FILE,
-                    "r",
-                    encoding="utf-8"
-                ) as file:
-
-                    data = json.load(file)
-
-                self.metadata = data.get(
-                    "metadata",
-                    {}
+            if not chunks:
+                raise ValueError(
+                    "No text chunks could be extracted from the PDF."
                 )
 
-                self.next_vector_id = data.get(
-                    "next_vector_id",
-                    1
-                )
-
-            except Exception as exc:
-
-                logger.error(
-                    "Failed to load FAISS metadata: %s",
-                    exc
-                )
-
-                self.metadata = {}
-                self.next_vector_id = 1
-
-        logger.info(
-            "FAISS vector count: %s",
-            self.index.ntotal
-        )
-
-        logger.info(
-            "FAISS metadata entries: %s",
-            len(self.metadata)
-        )
-
-    # ============================================================
-    # SAVE
-    # ============================================================
-
-    def _save(self):
-        """
-        Persist FAISS index and metadata to disk.
-        """
-
-        temp_index_file = (
-            FAISS_INDEX_FILE.with_suffix(".tmp")
-        )
-
-        faiss.write_index(
-            self.index,
-            str(temp_index_file)
-        )
-
-        temp_index_file.replace(
-            FAISS_INDEX_FILE
-        )
-
-        data = {
-            "next_vector_id": self.next_vector_id,
-            "metadata": self.metadata
-        }
-
-        temp_metadata_file = (
-            METADATA_FILE.with_suffix(".tmp")
-        )
-
-        with open(
-            temp_metadata_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                indent=2,
-                ensure_ascii=False
+            # Create document metadata.
+            document = document_manager.add_document(
+                filename=original_filename,
+                filesize=file_size,
+                stored_filename=stored_filename,
             )
 
-        temp_metadata_file.replace(
-            METADATA_FILE
-        )
-
-    # ============================================================
-    # ADD DOCUMENT
-    # ============================================================
-
-    def add_document(
-        self,
-        document_id,
-        filename,
-        chunks
-    ):
-        """
-        Add a document's chunks to the FAISS index.
-        """
-
-        if not chunks:
-            return 0
-
-        cleaned_chunks = [
-            chunk.strip()
-            for chunk in chunks
-            if chunk and chunk.strip()
-        ]
-
-        if not cleaned_chunks:
-            return 0
-
-        logger.info(
-            "Creating embedding for document: %s",
-            filename
-        )
-
-        embeddings = (
-            embedding_service.embed_documents(
-                cleaned_chunks
-            )
-        )
-
-        vectors = np.asarray(
-            embeddings,
-            dtype="float32"
-        )
-
-        vector_ids = []
-        metadata_entries = {}
-
-        with self.lock:
-
-            for index, chunk in enumerate(
-                cleaned_chunks
-            ):
-
-                vector_id = self.next_vector_id
-                self.next_vector_id += 1
-
-                vector_ids.append(
-                    vector_id
-                )
-
-                metadata_entries[
-                    str(vector_id)
-                ] = {
-                    "document_id": document_id,
-                    "filename": filename,
-                    "chunk_index": index,
-                    "text": chunk
-                }
-
-            ids = np.asarray(
-                vector_ids,
-                dtype="int64"
+            # Add chunks to FAISS.
+            faiss_chunks_added = vector_store.add_document(
+                document_id=document["id"],
+                filename=original_filename,
+                chunks=chunks,
             )
 
-            self.index.add_with_ids(
-                vectors,
-                ids
+            logger.info(
+                "FAISS indexing completed for %s: %s chunks added",
+                original_filename,
+                faiss_chunks_added,
             )
 
-            self.metadata.update(
-                metadata_entries
-            )
-
-            self._save()
-
-        logger.info(
-            "Added %s chunks to FAISS for document %s",
-            len(cleaned_chunks),
-            document_id
-        )
-
-        logger.info(
-            "Total vectors in FAISS: %s",
-            self.index.ntotal
-        )
-
-        return len(cleaned_chunks)
-
-    # ============================================================
-    # TOKENIZER
-    # ============================================================
-
-    def _tokenize(self, text):
-        """
-        Normalize and tokenize text for lexical search.
-        Handles common OCR/document variations such as:
-        - & -> and
-        - hyphen/slash punctuation
-        - multiple spaces
-        - common rent/cost variations
-        """
-
-        if not text:
-            return []
-
-        text = str(text).lower()
-
-        # Common document/OCR normalization
-        text = text.replace("&", " and ")
-        text = text.replace("/", " ")
-        text = text.replace("-", " ")
-
-        # Keep only alphanumeric characters and spaces
-        text = re.sub(
-            r"[^a-z0-9\s]",
-            " ",
-            text
-        )
-
-        # Normalize whitespace
-        text = re.sub(
-            r"\s+",
-            " ",
-            text
-        ).strip()
-
-        tokens = re.findall(
-            r"\b[a-z0-9]+\b",
-            text
-        )
-
-        # Lightweight normalization
-        normalized_tokens = []
-
-        aliases = {
-            "rental": "rent",
-            "renting": "rent",
-            "rented": "rent",
-            "prices": "price",
-            "pricing": "price",
-            "priced": "price",
-            "costs": "cost",
-            "costing": "cost",
-            "charges": "charge",
-            "charging": "charge",
-            "amounts": "amount",
-            "warehouses": "warehouse",
-            "offices": "office",
-            "spaces": "space",
-        }
-
-        for token in tokens:
-            normalized_tokens.append(
-                aliases.get(
-                    token,
-                    token
-                )
-            )
-        return normalized_tokens
-
-    # ============================================================
-    # LEXICAL SEARCH
-    # ============================================================
-
-    def _lexical_search(
-        self,
-        query,
-        top_k=15
-    ):
-        """
-        Lightweight BM25-style lexical search.
-
-        Useful for:
-        - names
-        - clause numbers
-        - dates
-        - exact terminology
-        - agreement names
-        """
-
-        query_tokens = self._tokenize(
-            query
-        )
-
-        if not query_tokens:
-            return []
-
-        documents = []
-
-        for vector_id, metadata in self.metadata.items():
-
-            tokens = self._tokenize(
-                metadata.get("text", "")
-            )
-
-            if tokens:
-
-                documents.append(
-                    (
-                        int(vector_id),
-                        tokens
-                    )
-                )
-
-        if not documents:
-            return []
-
-        total_documents = len(
-            documents
-        )
-
-        document_frequency = Counter()
-
-        for _, tokens in documents:
-
-            for token in set(tokens):
-
-                document_frequency[token] += 1
-
-        average_length = (
-            sum(
-                len(tokens)
-                for _, tokens in documents
-            )
-            / total_documents
-        )
-
-        k1 = 1.5
-        b = 0.75
-
-        query_term_counts = Counter(
-            query_tokens
-        )
-
-        scored_documents = []
-
-        for vector_id, tokens in documents:
-
-            token_counts = Counter(
-                tokens
-            )
-
-            document_length = len(
-                tokens
-            )
-
-            score = 0.0
-
-            for term, query_count in (
-                query_term_counts.items()
-            ):
-
-                term_frequency = (
-                    token_counts.get(
-                        term,
-                        0
-                    )
-                )
-
-                if term_frequency == 0:
-                    continue
-
-                df = document_frequency.get(
-                    term,
-                    0
-                )
-
-                idf = math.log(
-                    1
-                    + (
-                        total_documents
-                        - df
-                        + 0.5
-                    )
-                    / (
-                        df
-                        + 0.5
-                    )
-                )
-
-                denominator = (
-                    term_frequency
-                    + k1
-                    * (
-                        1
-                        - b
-                        + b
-                        * (
-                            document_length
-                            / average_length
-                        )
-                    )
-                )
-
-                term_score = (
-                    idf
-                    * (
-                        (
-                            term_frequency
-                            * (k1 + 1)
-                        )
-                        / denominator
-                    )
-                )
-
-                score += (
-                    term_score
-                    * query_count
-                )
-
-            if score > 0:
-
-                metadata = self.metadata.get(
-                    str(vector_id)
-                )
-
-                if metadata:
-
-                    scored_documents.append(
-                        {
-                            "score": float(score),
-                            "vector_id": vector_id,
-                            "document_id": metadata[
-                                "document_id"
-                            ],
-                            "filename": metadata[
-                                "filename"
-                            ],
-                            "chunk_index": metadata[
-                                "chunk_index"
-                            ],
-                            "text": metadata[
-                                "text"
-                            ]
-                        }
-                    )
-
-        scored_documents.sort(
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
-        return scored_documents[:top_k]
-
-    # ============================================================
-    # FAISS SEARCH
-    # ============================================================
-
-    def _semantic_search(
-        self,
-        query,
-        top_k=15
-    ):
-
-        query_embedding = (
-            embedding_service.embed_text(
-                query
-            )
-        )
-
-        query_vector = np.asarray(
-            [query_embedding],
-            dtype="float32"
-        )
-
-        scores, vector_ids = (
-            self.index.search(
-                query_vector,
-                top_k
-            )
-        )
-
-        results = []
-
-        for score, vector_id in zip(
-            scores[0],
-            vector_ids[0]
-        ):
-
-            if vector_id == -1:
-                continue
-
-            metadata = self.metadata.get(
-                str(int(vector_id))
-            )
-
-            if not metadata:
-                continue
-
-            results.append(
+            uploaded_documents.append(
                 {
-                    "score": float(score),
-                    "vector_id": int(vector_id),
-                    "document_id": metadata[
-                        "document_id"
-                    ],
-                    "filename": metadata[
-                        "filename"
-                    ],
-                    "chunk_index": metadata[
-                        "chunk_index"
-                    ],
-                    "text": metadata[
-                        "text"
-                    ]
+                    "document": document,
+                    "characters": len(text),
+                    "chunks": len(chunks),
+                    "faiss_chunks_added": faiss_chunks_added,
+                    "preview": text[:500],
                 }
             )
 
-        return results
-
-    # ============================================================
-    # DOCUMENT / INTENT BOOSTING
-    # ============================================================
-    def _normalize_text(self, text):
-        """
-        Normalize text consistently for document/query matching.
-        """
-
-        if not text:
-            return ""
-
-        text = str(text).lower()
-
-        # OCR/document normalization
-        text = text.replace("&", " and ")
-        text = text.replace("/", " ")
-        text = text.replace("-", " ")
-
-        text = re.sub(
-            r"[^a-z0-9\s]",
-            " ",
-            text
-        )
-
-        text = re.sub(
-            r"\s+",
-            " ",
-            text
-        ).strip()
-
-        # Common vocabulary normalization
-        replacements = {
-            "rental": "rent",
-            "renting": "rent",
-            "rented": "rent",
-            "prices": "price",
-            "pricing": "price",
-            "costs": "cost",
-            "charges": "charge",
-            "warehouses": "warehouse",
-            "offices": "office",
-            "spaces": "space",
-        }
-
-        words = text.split()
-
-        normalized_words = [
-            replacements.get(
-                word,
-                word
+        except Exception as exc:
+            logger.exception(
+                "Failed to process file: %s",
+                original_filename,
             )
-            for word in words
-        ]
 
-        return " ".join(
-            normalized_words
-        )
-
-    def _query_relevance_score(self, query, text):
-        """
-        Calculate robust lexical relevance between the user query
-        and a retrieved chunk.
-        Unlike simple token coverage, this method understands
-        business/document concepts and common OCR variations.
-        """
-
-        if not query or not text:
-            return 0.0
-
-        normalized_query = self._normalize_text(query)
-        normalized_text = self._normalize_text(text)
-
-        if not normalized_query or not normalized_text:
-            return 0.0
-
-        query_tokens = self._tokenize(
-            normalized_query
-        )
-
-        text_tokens = self._tokenize(
-            normalized_text
-        )
-
-        if not query_tokens or not text_tokens:
-            return 0.0
-
-        text_token_set = set(text_tokens)
-
-        # ============================================================
-        # STOP WORDS
-        # ============================================================
-        stopwords = {
-            "what",
-            "is",
-            "are",
-            "was",
-            "were",
-            "the",
-            "a",
-            "an",
-            "of",
-            "for",
-            "to",
-            "in",
-            "on",
-            "at",
-            "and",
-            "or",
-            "with",
-            "from",
-            "by",
-            "how",
-            "much",
-            "can",
-            "could",
-            "would",
-            "should",
-            "please",
-            "tell",
-            "me",
-            "give",
-            "according",
-            "does",
-            "do",
-            "about",
-        }
-
-        query_terms = [
-            token
-            for token in query_tokens
-            if token not in stopwords
-            and len(token) > 2
-        ]
-
-        if not query_terms:
-            return 0.0
-
-        # ============================================================
-        # DIRECT TOKEN MATCH
-        # ============================================================
-        matched_terms = sum(
-            1
-            for term in query_terms
-            if term in text_token_set
-        )
-
-        token_coverage = (
-            matched_terms
-            / len(query_terms)
-        )
-
-        # ============================================================
-        # BUSINESS CONCEPT MATCHING
-        # ============================================================
-        concept_groups = [
-            {
-                "name": "cost",
-                "terms": {
-                    "cost",
-                    "price",
-                    "rate",
-                    "amount",
-                    "charge",
-                    "rent",
-                },
-            },
-            {
-                "name": "warehouse",
-                "terms": {
-                    "warehouse",
-                },
-            },
-            {
-                "name": "office",
-                "terms": {
-                    "office",
-                },
-            },
-            {
-                "name": "open_space",
-                "terms": {
-                    "open",
-                    "space",
-                },
-            },
-        ]
-
-        query_concepts = []
-
-        for concept in concept_groups:
-            if any(
-                term in query_terms
-                for term in concept["terms"]
-            ):
-                query_concepts.append(
-                    concept
+            # Remove physical file if processing failed.
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception:
+                logger.exception(
+                    "Failed to remove incomplete file: %s",
+                    original_filename,
                 )
 
-        concept_matches = 0
-
-        for concept in query_concepts:
-            if any(
-                term in text_token_set
-                for term in concept["terms"]
-            ):
-                concept_matches += 1
-
-        concept_coverage = (
-            concept_matches
-            / len(query_concepts)
-            if query_concepts
-            else 0.0
-        )
-
-        # ============================================================
-        # PHRASE MATCHING
-        # ============================================================
-        phrase_bonus = 0.0
-        important_phrases = [
-            "open space",
-            "warehouse office",
-            "warehouse and office",
-            "rent of warehouse",
-            "warehouse rent",
-            "office rent",
-            "cost of rent",
-        ]
-
-        for phrase in important_phrases:
-            normalized_phrase = self._normalize_text(
-                phrase
-            )
-
-            if (
-                normalized_phrase
-                in normalized_text
-                and normalized_phrase
-                in normalized_query
-            ):
-                phrase_bonus = max(
-                    phrase_bonus,
-                    0.20
-                )
-
-        # ============================================================
-        # EXACT QUERY PHRASE
-        # ============================================================
-        exact_phrase_bonus = 0.0
-
-        if (
-            normalized_query
-            in normalized_text
-        ):
-            exact_phrase_bonus = 0.30
-
-        # ============================================================
-        # FINAL RELEVANCE
-        # ============================================================
-        # Concept matching is deliberately stronger than
-        # individual-token matching because OCR/table extraction
-        # can split or alter wording.
-        relevance = (
-            (token_coverage * 0.40)
-            + (concept_coverage * 0.50)
-            + phrase_bonus
-            + exact_phrase_bonus
-        )
-
-        return min(
-            1.0,
-            relevance
-        )
-
-    def _document_hint_score(self, query, filename):
-        """
-        Detect whether the query explicitly refers to
-        a document/file name.
-        Supports common OCR/document aliases such as:
-            WH -> warehouse
-            WHS -> warehouse
-            OFF -> office
-        """
-
-        query_text = self._normalize_text(query)
-        file_text = self._normalize_text(
-            Path(filename).stem
-        )
-
-        if not query_text or not file_text:
-            return 0.0
-
-        aliases = {
-            "wh": "warehouse",
-            "whs": "warehouse",
-            "warehouses": "warehouse",
-            "off": "office",
-            "offs": "office",
-            "offices": "office",
-        }
-
-        query_tokens = {
-            aliases.get(
-                token,
-                token
-            )
-            for token in query_text.split()
-        }
-        
-        file_tokens = {
-            aliases.get(
-                token,
-                token
-            )
-            for token in file_text.split()
-        }
-
-        generic_terms = {
-            "what",
-            "is",
-            "are",
-            "was",
-            "were",
-            "the",
-            "a",
-            "an",
-            "of",
-            "for",
-            "to",
-            "in",
-            "on",
-            "at",
-            "and",
-            "or",
-            "with",
-            "from",
-            "by",
-            "how",
-            "much",
-            "can",
-            "could",
-            "would",
-            "should",
-            "please",
-            "tell",
-            "me",
-            "agreement",
-            "document",
-            "file",
-            "pdf",
-        }
-
-        query_tokens -= generic_terms
-        file_tokens -= generic_terms
-
-        if not query_tokens or not file_tokens:
-            return 0.0
-        overlap = (
-            query_tokens
-            .intersection(file_tokens)
-        )
-
-        if not overlap:
-            return 0.0
-
-        # Query coverage is more useful than filename coverage.
-        query_coverage = (
-            len(overlap)
-            / len(query_tokens)
-        )
-
-        # Strong distinctive document names such as:
-        # Nagpur, Pune, Mumbai, AD, etc.
-        distinctive_tokens = {
-            token
-            for token in file_tokens
-            if token not in {
-                "lp",
-                "wh",
-                "warehouse",
-                "office",
-                "space",
-            }
-            and not token.isdigit()
-        }
-
-        distinctive_overlap = (
-            overlap
-            .intersection(
-                distinctive_tokens
-            )
-        )
-
-        score = (
-            query_coverage * 0.70
-        )
-        if distinctive_overlap:
-            score += 0.30
-        return min(
-            1.0,
-            score
-        )
-
-    def _detect_target_documents(self, query):
-        """
-        Detect documents explicitly referenced by the user query.
-        
-        Examples:
-            "Who signed the AD Inbound agreement?"
-                -> AD Inbound.pdf
-            "Who signed the Nagpur LP WH agreement?"
-                -> Nagpur LP WH agreement 2024-2027.pdf
-            "What is the rent of the Nagpur warehouse?"
-                -> Nagpur LP WH agreement 2024-2027.pdf
-        The detector supports common document/OCR abbreviations such as:
-            WH -> warehouse
-            WHS -> warehouse
-            OFF -> office
-        """
-
-        query_text = self._normalize_text(query)
-
-        if not query_text:
-            return set()
-
-        # ------------------------------------------------------------
-        # Query aliases
-        # ------------------------------------------------------------
-        query_aliases = {
-            "wh": "warehouse",
-            "whs": "warehouse",
-            "warehouses": "warehouse",
-            "off": "office",
-            "offs": "office",
-            "offices": "office",
-        }
-
-        query_tokens = set(
-            query_text.split()
-        )
-
-        normalized_query_tokens = set()
-
-        for token in query_tokens:
-            normalized_query_tokens.add(
-                query_aliases.get(
-                    token,
-                    token
-                )
-            )
-
-        # ------------------------------------------------------------
-        # Ignore generic document words
-        # ------------------------------------------------------------
-        generic_filename_terms = {
-            "agreement",
-            "agreements",
-            "document",
-            "documents",
-            "file",
-            "files",
-            "pdf",
-            "contract",
-            "contracts",
-        }
-
-        # Also ignore years because they are not good
-        # document identifiers by themselves.
-        query_tokens = {
-            token
-            for token in normalized_query_tokens
-            if token not in generic_filename_terms
-            and not token.isdigit()
-            and len(token) > 1
-        }
-
-        if not query_tokens:
-            return set()
-
-        # ------------------------------------------------------------
-        # Group metadata by document
-        # ------------------------------------------------------------
-        documents = {}
-
-        for metadata in self.metadata.values():
-            filename = metadata.get(
-                "filename",
-                ""
-            )
-
-            if not filename:
-                continue
-
-            filename_tokens = self._normalize_text(
-                Path(filename).stem
-            ).split()
-
-            normalized_filename_tokens = set()
-
-            for token in filename_tokens:
-                # Filename aliases
-                filename_aliases = {
-                    "wh": "warehouse",
-                    "whs": "warehouse",
-                    "warehouses": "warehouse",
-                    "off": "office",
-                    "offs": "office",
-                    "offices": "office",
+            failed_documents.append(
+                {
+                    "filename": original_filename,
+                    "error": str(exc),
                 }
-
-                normalized_token = filename_aliases.get(
-                    token,
-                    token
-                )
-
-                if (
-                    normalized_token
-                    not in generic_filename_terms
-                    and not normalized_token.isdigit()
-                    and len(normalized_token) > 1
-                ):
-                    normalized_filename_tokens.add(
-                        normalized_token
-                    )
-            documents[filename] = (
-                normalized_filename_tokens
             )
-        # ------------------------------------------------------------
-        # Score each document
-        # ------------------------------------------------------------
-        document_scores = {}
+    logger.info(
+        "Multiple upload completed. Success: %s | Failed: %s",
+        len(uploaded_documents),
+        len(failed_documents),
+    )
 
-        for filename, filename_tokens in documents.items():
-            if not filename_tokens:
-                continue
+    return {
+        "message": "Upload processing completed.",
+        "total_files": len(files),
+        "successful_files": len(uploaded_documents),
+        "failed_files": len(failed_documents),
+        "documents": uploaded_documents,
+        "failures": failed_documents,
+    }
 
-            overlap = (
-                query_tokens
-                .intersection(filename_tokens)
-            )
+@app.post("/ask")
+async def ask_question(request: QuestionRequest, current_user: dict = Depends(get_current_user),):
+    logger.info(
+        "Received question: %s",
+        request.question,
+    )
 
-            if not overlap:
-                continue
+    # ============================================================
+    # SEARCH
+    # ============================================================
+    results = vector_store.search(
+        query=request.question,
+        top_k=5,
+    )
 
-            overlap_count = len(overlap)
-            overlap_ratio = (
-                overlap_count
-                / len(filename_tokens)
-            )
+    # ============================================================
+    # SIGNATURE QUESTION DOCUMENT FILTERING
+    # ============================================================
+    signature_keywords = [
+        "signatory",
+        "signatories",
+        "signature",
+        "signatures",
+        "signed",
+        "signed by",
+        "who signed",
+        "authorized signatory",
+        "authorised signatory",
+        "esign",
+        "e sign",
+    ]
+    normalized_question = request.question.lower()
 
-            query_coverage = (
-                overlap_count
-                / len(query_tokens)
-            )
+    is_signature_question = any(
+        keyword in normalized_question
+        for keyword in signature_keywords
+    )
 
-            # --------------------------------------------------------
-            # Distinctive document identifiers
-            #
-            # A single strong identifier such as "Nagpur"
-            # should be enough to identify a document.
-            #
-            # Generic words such as "agreement", "document",
-            # "file", etc. have already been removed.
-            # --------------------------------------------------------
-            distinctive_tokens = {
-                token
-                for token in filename_tokens
-                if token not in {
-                    "lp",
-                    "wh",
-                    "warehouse",
-                    "office",
-                    "space",
-                }
+    if is_signature_question:
+        signature_results = [
+            result
+            for result in results
+            if result.get("signature_score", 0.0) > 0
+            and result.get("document_score", 0.0) > 0
+        ]
+
+        if signature_results:
+            selected = signature_results[:2]
+            selected_ids = {
+                result["vector_id"]
+                for result in selected
             }
+            for result in results:
+                if len(selected) >= 4:
+                    break
+                if result["vector_id"] in selected_ids:
+                    continue
+                if result.get("document_score", 0.0) > 0:
+                    selected.append(result)
+            results = selected
 
-            distinctive_overlap = (
-                overlap
-                .intersection(
-                    distinctive_tokens
-                )
+            logger.info(
+                "Signature-question filtering applied. "
+                "Remaining results: %s",
+                len(results),
             )
 
-            # --------------------------------------------------------
-            # Determine whether this is an explicit document match
-            # --------------------------------------------------------
-            is_strong_match = (
-                overlap_count >= 2
-                or overlap_ratio >= 0.50
-                or query_coverage >= 0.50
-                or len(distinctive_overlap) >= 1
-            )
-
-            if not is_strong_match:
-                continue
-
-            # --------------------------------------------------------
-            # Ranking score
-            #
-            # Priority:
-            # 1. distinctive identifier
-            # 2. number of matching tokens
-            # 3. query coverage
-            # 4. filename coverage
-            # --------------------------------------------------------
-            distinctive_bonus = (
-                1.0
-                if distinctive_overlap
-                else 0.0
-            )
-
-            score = (
-                distinctive_bonus * 10.0
-                + overlap_count * 3.0
-                + query_coverage * 2.0
-                + overlap_ratio
-            )
-
-            document_scores[filename] = {
-                "score": score,
-                "overlap": overlap,
-                "overlap_count": overlap_count,
-                "overlap_ratio": overlap_ratio,
-                "query_coverage": query_coverage,
-                "distinctive_overlap": distinctive_overlap,
-            }
-        if not document_scores:
-            return set()
-
-        # ------------------------------------------------------------
-        # Find strongest document match
-        # ------------------------------------------------------------
-        best_score = max(
-            item["score"]
-            for item in document_scores.values()
-        )
-
-        target_documents = {
-            filename
-            for filename, item in document_scores.items()
-            if abs(
-                item["score"] - best_score
-            ) < 0.000001
+    # ============================================================
+    # NO RESULTS
+    # ============================================================
+    if not results:
+        return {
+            "question": request.question,
+            "answer": "Please upload PDF first.",
+            "sources": [],
         }
 
-        logger.info(
-            "Explicit document detection: query='%s' -> %s",
-            query,
-            list(target_documents)
-        )
-        return target_documents
+    # ============================================================
+    # LOG RETRIEVED CHUNKS
+    # ============================================================
+    logger.info(
+        "FAISS returned %s relevant chunks for question: %s",
+        len(results),
+        request.question,
+    )
 
-    def _intent_score(self, query, text):
-        """
-        Boost chunks that match the intent of the question.
-        """
-        query_text = self._normalize_text(
-            query
-        )
-        chunk_text = self._normalize_text(
-            text
-        )
-        if not query_text or not chunk_text:
-            return 0.0
-        # --------------------------------------------------------
-        # Signatory / signature questions
-        # --------------------------------------------------------
-        signatory_terms = [
-            "signatory",
-            "signatories",
-            "signature",
-            "signatures",
-            "signed",
-            "esign",
-            "e sign",
-            "authorized signatory",
-            "authorised signatory",
-            "witness whereof",
-        ]
-        if any(
-            term in query_text
-            for term in signatory_terms
-        ):
-            matching_terms = 0
-            for term in signatory_terms:
-                if term in chunk_text:
-                    matching_terms += 1
-            if matching_terms:
-                return min(
-                    1.0,
-                    0.25
-                    * matching_terms
-                )
-        return 0.0
+    # ============================================================
+    # BUILD GEMINI CONTEXT
+    # ============================================================
+    context_parts = []
+    for result in results:
+        context_parts.append(
+            f"""
+DOCUMENT:
+{result['filename']}
+CHUNK:
+{result['chunk_index']}
+RETRIEVAL RELEVANCE:
+{result.get('relevance_score', 0.0):.3f}
+SIGNATURE RELEVANCE:
+{result.get('signature_score', 0.0):.3f}
+CONTENT:
+{result['text']}
+"""
+       )
+    context = "\n\n====================\n\n".join(
+        context_parts
+    )
 
-    def _signature_score(self, query, text):
-        """
-        Detect chunks that are likely to contain
-        actual agreement signatories.
-        """
-        query_text = self._normalize_text(query)
-        chunk_text = self._normalize_text(text)
-        if not query_text or not chunk_text:
-            return 0.0
-        signatory_query_terms = [
-            "signatory",
-            "signatories",
-            "who signed",
-            "signed by",
-            "signature",
-            "signatures",
-        ]
-        is_signature_question = any(
-            term in query_text
-            for term in signatory_query_terms
-        )
-        if not is_signature_question:
-            return 0.0
-        score = 0.0
-        # --------------------------------------------------------
-        # Strong signature indicators
-        # --------------------------------------------------------
-        signature_indicators = [
-            "esign by signdesk",
-            "electronic signature",
-            "electronic signing",
-            "signed",
-            "signature",
-            "signatory",
-            "authorized signatory",
-            "authorised signatory",
-            "in witness whereof",
-        ]
-        indicator_count = sum(
-            1
-            for term in signature_indicators
-            if term in chunk_text
-        )
-        score += min(
-            0.60,
-            indicator_count * 0.15
-        )
-        # --------------------------------------------------------
-        # Person-name pattern
-        #
-        # OCR commonly produces:
-        #
-        # Rakesh Sen Rakesh Sen
-        # Rampraveen Swaminathan
-        #
-        # We give a modest bonus to chunks containing
-        # multiple capitalized-name-like patterns.
-        # --------------------------------------------------------
-        import re
-        name_matches = re.findall(
-            r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b",
-            text
-        )
-        unique_names = set(
-            name.strip()
-            for name in name_matches
-        )
-        if len(unique_names) >= 2:
-            score += 0.40
-        elif len(unique_names) == 1:
-            score += 0.20
-        return min(
-            1.0,
-            score
+    # ============================================================
+    # ASK GEMINI
+    # ============================================================
+    answer = ask_gemini(
+        context,
+        request.question,
+    )
+
+    # ============================================================
+    # SOURCES
+    # ============================================================
+    sources = []
+    for result in results:
+        sources.append(
+            {
+                "document_id": result.get("document_id"),
+                "filename": result.get("filename"),
+                "chunk_index": result.get("chunk_index"),
+                "text": result.get("text", ""),
+                "score": result.get("final_score", 0.0),
+            }
         )
 
     # ============================================================
-    # HYBRID SEARCH
+    # RESPONSE
     # ============================================================
-    def search(
-        self,
-        query,
-        top_k=5
-    ):
-        """
-        Improved hybrid retrieval.
-        Pipeline:
-        1. FAISS semantic retrieval
-        2. BM25-style lexical retrieval
-        3. Reciprocal Rank Fusion
-        4. Query relevance scoring
-        5. Intent/document/signature boosting
-        6. Weak-result filtering
-        7. Final top-K results
-        """
+    return {
+        "question": request.question,
+        "answer": answer,
+        "sources": sources,
+    }
 
-        if not query or not query.strip():
-            return []
-        if self.index.ntotal == 0:
-            return []
+@app.get("/documents")
+def list_documents(current_user: dict = Depends(get_current_user),):
+    documents = document_manager.get_documents()
+    return {
+        "total_documents": len(documents),
+        "documents": documents,
+    }
 
-        normalized_query = self._normalize_text(query)
+@app.get("/documents/consistency")
+def document_consistency():
+   consistency = vector_store.check_consistency()
+   return consistency
 
-        # ============================================================
-        # EXPLICIT DOCUMENT DETECTION
-        # ============================================================
-        target_documents = self._detect_target_documents(
-            query
-        )
-        has_explicit_document = bool(
-            target_documents
-        )
-        if has_explicit_document:
-            logger.info(
-                "Target document(s) detected: %s",
-                list(target_documents)
-            )
-        
-        signature_query_terms = [
-            "signatory",
-            "signatories",
-            "signature",
-            "signatures",
-            "signed",
-            "signed by",
-            "who signed",
-            "authorized signatory",
-            "authorised signatory",
-            "esign",
-            "e sign",
-        ]
-
-        is_signature_question = any(
-            term in normalized_query
-            for term in signature_query_terms
-        )
-
-        # ============================================================
-        # 1. RETRIEVE MORE CANDIDATES
-        # ============================================================
-        semantic_results = self._semantic_search(
-            query,
-            top_k=20
-        )
-
-        lexical_results = self._lexical_search(
-            query,
-            top_k=20
-        )
-
-        # ============================================================
-        # 2. RECIPROCAL RANK FUSION
-        # ============================================================
-        fusion_scores = {}
-        result_lookup = {}
-
-        rrf_k = 60
-
-        # ------------------------------------------------------------
-        # Semantic results
-        # ------------------------------------------------------------
-        for rank, result in enumerate(
-            semantic_results,
-            start=1
-        ):
-            vector_id = result["vector_id"]
-            fusion_scores.setdefault(
-                vector_id,
-                0.0
-            )
-            fusion_scores[vector_id] += (
-                1.0 / (rrf_k + rank)
-            )
-            result_lookup[vector_id] = dict(
-                result
-            )
-            result_lookup[vector_id][
-                "semantic_score"
-            ] = float(
-                result.get(
-                    "score",
-                    0.0
-                )
-            )
-
-        # ------------------------------------------------------------
-        # ------------------------------------------------------------
-        # Lexical results
-        # ------------------------------------------------------------
-        for rank, result in enumerate(
-            lexical_results,
-            start=1
-        ):
-            vector_id = result["vector_id"]
-            fusion_scores.setdefault(
-                vector_id,
-                0.0
-            )
-            fusion_scores[vector_id] += (
-                1.0 / (rrf_k + rank)
-            )
-
-            if vector_id not in result_lookup:
-                result_lookup[vector_id] = dict(
-                    result
-                )
-                result_lookup[vector_id][
-                    "semantic_score"
-                ] = 0.0
-
-            result_lookup[vector_id][
-                "lexical_score"
-            ] = float(
-                result.get(
-                    "score",
-                    0.0
-                )
-            )
-   
-        # ============================================================
-        # 3. BUILD CANDIDATES
-        # ============================================================
-        ranked_results = []
-
-        for vector_id, fusion_score in (
-            fusion_scores.items()
-        ):
-            result_metadata = result_lookup.get(
-                vector_id
-            )
-
-            if not result_metadata:
-                continue
-
-            if (
-                has_explicit_document
-                and result_metadata.get("filename")
-                not in target_documents
-            ):
-                logger.debug(
-                    "Exclude unrelated document: %s | query=%s",
-                    result_metadata.get("filename"),
-                    query
-                )
-                continue
-
-            result = dict(
-                result_lookup[vector_id]
-            )
-            result["fusion_score"] = float(
-                fusion_score
-            )
-            result.setdefault(
-                "semantic_score",
-                0.0
-            )
-            result.setdefault(
-                "lexical_score",
-                0.0
-            )
-
-            # ========================================================
-            # QUERY RELEVANCE
-            # ========================================================
-            relevance_score = (
-                self._query_relevance_score(
-                    query,
-                    result["text"]
-                )
-            )
-
-            # ========================================================
-            # DOCUMENT NAME SCORE
-            # ========================================================
-            document_score = (
-                self._document_hint_score(
-                    query,
-                    result["filename"]
-                )
-            )
-
-            document_reference_boost = 0.0
-
-            if (
-                has_explicit_document
-                and result["filename"] in target_documents
-            ):
-                document_reference_boost = 0.20
-
-            elif document_score >= 0.50:
-                document_reference_boost = 0.15
-            elif document_score >= 0.25:
-                document_reference_boost = 0.08
-
-            result["document_reference_boost"] = float(
-                document_reference_boost
-            )
-
-            # ========================================================
-            # INTENT SCORE
-            # ========================================================
-            intent_score = (
-                self._intent_score(
-                    query,
-                    result["text"]
-                )
-            )
-
-            # ========================================================
-            # SIGNATURE SCORE
-            # Only apply signature boosting when the user is
-            # actually asking about signatures/signatories.
-            # ========================================================
-            signature_query_terms = [
-                "signatory",
-                "signatories",
-                "signature",
-                "signatures",
-                "signed",
-                "signed by",
-                "who signed",
-                "authorized signatory",
-                "authorised signatory",
-                "esign",
-                "e sign",
-            ]
-            normalized_query = self._normalize_text(query)
-
-            is_signature_question = any(
-                term in normalized_query
-                for term in signature_query_terms
-            )
-
-            if is_signature_question:
-                signature_score = calculate_signature_score(
-                    result["text"]
-                )
-            else:
-                signature_score = 0.0
-
-            result["relevance_score"] = float(
-                relevance_score
-            )
-            result["document_score"] = float(
-                document_score
-            )
-            result["intent_score"] = float(
-                intent_score
-            )
-            result["signature_score"] = float(
-                signature_score
-            )
-
-            # ========================================================
-            # FINAL SCORE
-            #
-            # Semantic similarity is the primary signal.
-            # Lexical relevance supports exact business terminology.
-            # RRF is only a supporting signal.
-            # ========================================================
-            result["final_score"] = (
-                (
-                    result["semantic_score"]
-                    * 0.60
-                )
-                + (
-                    relevance_score
-                    * 0.20
-                )
-                + (
-                    result["fusion_score"]
-                    * 0.15
-                )
-                + (
-                    document_score
-                    * 0.03
-                )
-                + (
-                    document_reference_boost
-                )
-                + (
-                    intent_score
-                    * 0.01
-                )
-                + (
-                    signature_score
-                    * 0.03
-                )
-            )
-
-            if "Nagpur" in result["filename"]:
-                logger.info(
-                    "DEBUG NAGPUR: FILE=%s CHUNK=%s "
-                    "FINAL=%.6f FUSION=%.6f "
-                    "SEMANTIC=%.6f LEXICAL=%.6f "
-                    "RELEVANCE=%.3f DOC=%.3f "
-                    "DOC_BOOST=%.3f "
-                    "INTENT=%.3f SIGNATURE=%.3f",
-
-                    result["filename"],
-                    result["chunk_index"],
-                    result["final_score"],
-                    result["fusion_score"],
-                    result["semantic_score"],
-                    result["lexical_score"],
-                    result["relevance_score"],
-                    result["document_score"],
-                    result.get(
-                        "document_reference_boost",
-                        0.0
-                    ),
-                    result["intent_score"],
-                    result["signature_score"]
-                )
-            ranked_results.append(
-                result
-            )
-
-            if (
-                is_signature_question
-                and result["filename"] == "Nagpur LP WH agreement 2024-2027.pdf"
-            ):
-                logger.info(
-                    "\n==== SIGNATURE CHUNK DEBUG ====\n"
-                    "FILE: %s\n"
-                    "CHUNK: %s\n"
-                    "TEXT: %s\n"
-                    "================================",
-                    result["filename"],
-                    result["chunk_index"],
-                    result["text"]
-                )
-
-        # ============================================================
-        # 4. SORT
-        # ============================================================
-        ranked_results.sort(
-            key=lambda x: x["final_score"],
-            reverse=True
-        )
-
-        # ============================================================
-        # 5. FILTER WEAK RESULTS
-        # ============================================================
-        filtered_results = []
-        for result in ranked_results:
-            relevance = result.get(
-                "relevance_score",
-                0.0
-            )
-
-            semantic = result.get(
-                "semantic_score",
-                0.0
-            )
-
-            lexical = result.get(
-                "lexical_score",
-                0.0
-            )
-
-            fusion = result.get(
-                "fusion_score",
-                0.0
-            )
-
-            final_score = result.get(
-                "final_score",
-                0.0
-            )
-
-            document_score = result.get(
-                "document_score",
-                0.0
-            )
-
-            intent_score = result.get(
-                "intent_score",
-                0.0
-            )
-
-            signature_score = result.get(
-                "signature_score",
-                0.0
-            )
-
-            document_reference_boost = result.get(
-                "document_reference_boost",
-                0.0
-            )
-
-            # --------------------------------------------------------
-            # Keep reasonably strong candidates.
-            #
-            # Do NOT require a very high score because a valid
-            # RAG answer may be distributed across multiple chunks.
-            # --------------------------------------------------------
-            keep_result = (
-                relevance >= 0.15
-                or semantic >= 0.30
-                or lexical >= 1.0
-                or final_score >= 0.30
-                or document_score >= 0.50
-                or signature_score >= 0.60
-                or intent_score >= 0.50
-                or document_reference_boost >= 0.10
-            )
-
-            if keep_result:
-                filtered_results.append(
-                    result
-                )
-
-            else:
-                logger.debug(
-                    "Filtered weak RAG result: %s | "
-                    "chunk=%s | final=%.3f | relevance=%.3f | "
-                    "semantic=%.3f | lexical=%.3f "
-                    "doc=%.3f | doc_boost=%.3f | "
-                    "intent=%.3f | signature=%.3f | fusion=%.6f",
-
-                    result["filename"],
-                    result["chunk_index"],
-                    final_score,
-                    relevance,
-                    semantic,
-                    lexical,
-                    document_score,
-                    document_reference_boost,
-                    intent_score,
-                    signature_score,
-                    fusion,
-                )   
-
-        # ============================================================
-        # 6. FALLBACK
-        # ============================================================
-        if not filtered_results:
-            logger.warning(
-                "No results passed relevance filtering. "
-                "Returning strongest semantic candidates."
-            )
-            filtered_results = ranked_results[:top_k]
-
-        # ============================================================
-        # 7. DOCUMENT-DIVERSE FINAL RESULTS
-        #
-        # Allow up to 2 chunks for the same document while
-        # preventing a single document from dominating the
-        # final RAG context.
-        # ============================================================
-        final_results = self._apply_document_diversity(
-            filtered_results,
-            top_k=top_k,
-            max_per_document=2
-        )
-        
-        # ============================================================
-        # 8. LOGGING
-        # ============================================================
-        if has_explicit_document:
-            logger.info(
-                "Explicit document filtering applied. "
-                "Allowed documents: %s",
-                list(target_documents)
-            )
-
-        logger.info(
-            "Improved hybrid search: "
-            "semantic=%s lexical=%s candidates=%s final=%s",
-            len(semantic_results),
-            len(lexical_results),
-            len(ranked_results),
-            len(final_results)
-        )
-
-        for rank, result in enumerate(
-            final_results,
-            start=1
-        ):
-            logger.info(
-                "RANK=%s FILE=%s CHUNK=%s "
-                "FINAL=%.6f FUSION=%.6f "
-                "SEMANTIC=%.6f LEXICAL=%.6f "
-                "RELEVANCE=%.3f DOC=%.3f "
-                "DOC_BOOST=%.3f "
-                "INTENT=%.3f SIGNATURE=%.3f",
-
-                rank,
-                result["filename"],
-                result["chunk_index"],
-                result["final_score"],
-                result["fusion_score"],
-                result["semantic_score"],
-                result["lexical_score"],
-                result["relevance_score"],
-                result["document_score"],
-                result["document_reference_boost"],
-                result["intent_score"],
-                result["signature_score"],
-            )
-        return final_results
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+    logger.info(
+        "Delete request received for document: %s",
+        document_id,
+    )
 
     # ============================================================
-    # DELETE DOCUMENT
+    # STEP 1 — FIND DOCUMENT
     # ============================================================
+    documents = document_manager.get_documents()
 
-    def delete_document(
-        self,
-        document_id
-    ):
+    document = next(
+        (
+            item
+            for item in documents
+            if item.get("id") == document_id
+        ),
+        None
+    )
 
-        vector_ids = []
+    if document is None:
+        logger.warning(
+            "Document not found for deletion: %s",
+            document_id
+        )
+        return {
+            "success": False,
+            "message": "Document not found.",
+        }
 
-        for vector_id, metadata in (
-            self.metadata.items()
-        ):
+    filename = document.get(
+        "filename",
+        ""
+    )
 
-            if metadata.get(
-                "document_id"
-            ) == document_id:
+    stored_filename = document.get(
+        "stored_filename",
+        filename
+   )
 
-                vector_ids.append(
-                    int(vector_id)
-                )
+    logger.info(
+        "Deleting RAG document: %s -> %s",
+        filename,
+        document_id,
+    )
 
-        if not vector_ids:
-
-            logger.info(
-                "No FAISS vectors found for document: %s",
-                document_id
-            )
-
-            return 0
-
-        with self.lock:
-
-            ids = np.asarray(
-                vector_ids,
-                dtype="int64"
-            )
-
-            removed = (
-                self.index.remove_ids(
-                    ids
-                )
-            )
-
-            for vector_id in vector_ids:
-
-                self.metadata.pop(
-                    str(vector_id),
-                    None
-                )
-
-            self._save()
-
-        logger.info(
-            "Removed %s vectors for document: %s",
-            removed,
+    # ============================================================
+    # STEP 2 — DELETE FAISS VECTORS FIRST
+    # ============================================================
+    try:
+        faiss_deleted = vector_store.delete_document(
             document_id
         )
 
         logger.info(
-            "Total vectors in FAISS after deletion: %s",
-            self.index.ntotal
+            "FAISS vectors removed for document %s: %s",
+            document_id,
+            faiss_deleted,
         )
 
-        return int(removed)
+    except Exception as exc:
+        logger.exception(
+            "FAISS deletion failed for document %s",
+            document_id
+        )
+
+        # --------------------------------------------------------
+        # IMPORTANT:
+        # Do NOT delete documents.json or physical PDF
+        # if FAISS deletion fails.
+        # --------------------------------------------------------
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Document deletion stopped because "
+                "FAISS cleanup failed."
+            )
+        ) from exc
 
     # ============================================================
-    # DOCUMENT VECTOR COUNT
+    # STEP 3 — DELETE DOCUMENT METADATA
     # ============================================================
-
-    def get_document_vector_count(
-        self,
+    deleted_document = document_manager.delete_document(
         document_id
-    ):
+    )
 
-        count = 0
-
-        for metadata in (
-            self.metadata.values()
-        ):
-
-            if metadata.get(
-                "document_id"
-            ) == document_id:
-
-                count += 1
-
-        return count
-
-    # ============================================================
-    # TOTAL VECTOR COUNT
-    # ============================================================
-
-    def get_total_vector_count(self):
-
-        return self.index.ntotal
-
-    def _apply_document_diversity(
-        self,
-        results,
-        top_k=5,
-        max_per_document=2,
-    ):
-        """
-        Prevent one document from occupying too many
-        positions in the final RAG context.
-        Results must already contain final_score.
-        """
-
-        if not results:
-            return []
-
-        # Highest scoring results first.
-        ranked_results = sorted(
-            results,
-            key=lambda item: item.get("final_score", 0.0),
-            reverse=True,
+    if deleted_document is None:
+        logger.error(
+            "FAISS deletion succeeded but document metadata "
+            "deletion failed for document: %s",
+            document_id
         )
 
-        selected = []
-        document_counts = {}
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "FAISS vectors were deleted, but document "
+                "metadata could not be removed."
+            )
+        )
 
-        for result in ranked_results:
-            filename = result.get(
-                "filename",
-                "unknown_document",
+    # ============================================================
+    # STEP 4 — DELETE PHYSICAL PDF
+    # ============================================================
+    file_path = UPLOAD_FOLDER / stored_filename
+    physical_file_deleted = False
+
+    if file_path.exists():
+        try:
+            file_path.unlink()
+            physical_file_deleted = True
+
+            logger.info(
+                "Physical PDF deleted: %s",
+                file_path
             )
 
-            count = document_counts.get(filename, 0)
+        except Exception as exc:
+            logger.exception(
+                "Could not delete physical PDF: %s",
+                file_path
+            )
 
-            if count >= max_per_document:
-                continue
+            # ----------------------------------------------------
+            # The RAG document has already been removed from
+            # FAISS and metadata.
+            #
+            # We report the physical-file cleanup failure
+            # separately.
+            # ----------------------------------------------------
+            return {
+                "success": True,
+                "message": (
+                    "Document deleted from RAG successfully, "
+                    "but physical PDF cleanup failed."
+                ),
+                "document": deleted_document,
+                "faiss_vectors_deleted": faiss_deleted,
+                "physical_file_deleted": False,
+                "physical_file_error": str(exc),
+            }
+    else:
+        logger.warning(
+            "Physical PDF not found: %s",
+            file_path
+        )
 
-            selected.append(result)
-            document_counts[filename] = count + 1
-            if len(selected) >= top_k:
-                break
-        return selected
+    # ============================================================
+    # STEP 5 — FINAL RESPONSE
+    # ============================================================
+    return {
+        "success": True,
+        "message": "Document deleted successfully.",
+        "document": deleted_document,
+        "faiss_vectors_deleted": faiss_deleted,
+        "physical_file_deleted": physical_file_deleted,
+    }
 
-vector_store = FAISSVectorStore()
+@app.get("/auth/sso")
+async def sso_login():
+    raise HTTPException(
+        status_code=501,
+        detail="SSO login not implemented yet. Please use the demo login.",
+    )
+
+def custom_openapi():
+   if app.openapi_schema:
+       return app.openapi_schema
+   schema = get_openapi(
+       title=app.title,
+       version="1.0.0",
+       description="PDF RAG Backend API",
+       routes=app.routes,
+   )
+   components = schema.get("components", {}).get("schemas", {})
+   for component in components.values():
+       properties = component.get("properties", {})
+       for prop in properties.values():
+           # Array of uploaded files
+           if (
+               prop.get("type") == "array"
+               and isinstance(prop.get("items"), dict)
+           ):
+               items = prop["items"]
+               if items.get("contentMediaType") == "application/octet-stream":
+                   items.pop("contentMediaType", None)
+                   items["type"] = "string"
+                   items["format"] = "binary"
+           # Single uploaded file
+           elif (
+               prop.get("type") == "string"
+               and prop.get("contentMediaType") == "application/octet-stream"
+           ):
+               prop.pop("contentMediaType", None)
+               prop["format"] = "binary"
+   app.openapi_schema = schema
+   return app.openapi_schema
+
+app.openapi = custom_openapi
+
+//security.py
+import os
+from datetime import datetime, timedelta, timezone
+from jose import JWTError, jwt
+
+SECRET_KEY = os.getenv(
+    "JWT_SECRET_KEY",
+    "development-only-change-this-secret"
+)
+
+ALGORITHM = "HS256"
+
+ACCESS_TOKEN_EXPIRE_MINUTES = int(
+    os.getenv(
+        "ACCESS_TOKEN_EXPIRE_MINUTES",
+        "60"
+    )
+)
+
+def create_access_token(
+    user: dict,
+):
+    """
+    Create a JWT access token for an authenticated user.
+    """
+    now = datetime.now(
+        timezone.utc
+    )
+    expire = now + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    payload = {
+        "sub": str(
+            user.get("id")
+        ),
+        "username": user.get(
+            "username"
+        ),
+        "name": user.get(
+            "name"
+        ),
+        "loginType": user.get(
+            "loginType",
+            "form"
+        ),
+        "iat": now,
+        "exp": expire,
+    }
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+def decode_access_token(
+    token: str,
+):
+    """
+    Decode and validate an access token.
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+        )
+        return payload
+    except JWTError:
+        return None
+
+//auth_dependency.py
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from services.security import decode_access_token
+
+security = HTTPBearer(
+    auto_error=False
+)
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(
+        security
+    ),
+):
+    """
+    Validate the JWT bearer token and return
+    the authenticated user information.
+    """
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+    
+    token = credentials.credentials
+    payload = decode_access_token(
+        token
+    )
+
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token.",
+        )
+    
+    user_id = payload.get(
+        "sub"
+    )
+
+    username = payload.get(
+        "username"
+    )
+
+    if not user_id or not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token.",
+        )
+
+    return {
+        "id": user_id,
+        "username": username,
+        "name": payload.get(
+            "name",
+            username
+        ),
+        "loginType": payload.get(
+            "loginType",
+            "form"
+        ),
+    }
+
+//routers/ auth.py
+from fastapi import APIRouter, HTTPException
+
+from models.auth import LoginRequest
+from services.auth_service import auth_service
+from services.security import create_access_token
+
+router = APIRouter(
+    prefix="/auth",
+    tags=["Authentication"]
+)
+
+@router.post("/login")
+def login(request: LoginRequest):
+    user = auth_service.authenticate(username=request.username, password=request.password)
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    access_token = create_access_token(user)
+
+    return {
+        "success": True,
+        "user": user,
+        "access_token": access_token,
+        "token_type": "bearer",
+    }
