@@ -1,0 +1,12 @@
+//backend / metadata / documents.json
+[
+    {
+        "id": "765a9cd4-1c7c-4b3a-9347-858140b3bbed",
+        "filename": "Nagpur  LP WH agreement 2024-2027.pdf",
+        "stored_filename": "ce94ba8863e047f6894b6dde2d9fef6a_Nagpur  LP WH agreement 2024-2027.pdf",
+        "filesize": 2647398,
+        "uploaded_at": "2026-08-31T16:47:07.291334",
+        "status": "Indexed",
+        "user_id": "demo-user"
+    }
+]
