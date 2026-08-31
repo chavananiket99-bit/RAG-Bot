@@ -1,0 +1,524 @@
+//backend / app.py
+from fastapi.openapi.utils import get_openapi
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+from typing import Annotated
+from fastapi.middleware.cors import CORSMiddleware
+
+import shutil
+import os
+import time
+import logging
+import uuid
+from pathlib import Path
+
+from services.pdf_service import extract_text
+from models.question import QuestionRequest
+from services.vector_store import vector_store
+from services.gemini_service import ask_gemini
+from services.document_manager import document_manager
+
+from routers.auth import router as auth_router
+
+app = FastAPI()
+app.include_router(auth_router)
+logger = logging.getLogger("uvicorn.error")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_FOLDER = BASE_DIR / "uploads"
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    logger.info(
+        "Request started: %s %s",
+        request.method,
+        request.url.path,
+    )
+    
+    response = await call_next(request)
+    duration_ms = (time.time() - start_time) * 1000
+
+    logger.info(
+        "Request completed: %s %s -> %s (%.2f ms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+
+    return response
+
+@app.get("/")
+def home():
+    return {
+        "message": "PDF RAG Backend Running"
+    }
+
+@app.post("/upload")
+async def upload_files(files: Annotated[list[UploadFile], File(...)]):
+    logger.info(
+        "Multiple upload request received. Files: %s",
+        len(files),
+    )
+
+    uploaded_documents = []
+    failed_documents = []
+
+    for file in files:
+        original_filename = Path(file.filename or "uploaded_file.pdf").name
+
+        logger.info(
+            "Processing uploaded file: %s",
+            original_filename,
+        )
+
+        try:
+            # Create a unique physical filename.
+            unique_id = uuid.uuid4().hex
+            stored_filename = (
+                f"{unique_id}_{original_filename}"
+            )
+
+            file_path = UPLOAD_FOLDER / stored_filename
+
+            logger.info(
+                "Saving physical file: %s",
+                file_path,
+            )
+
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            file_size = os.path.getsize(file_path)
+
+            logger.info(
+                "File saved successfully: %s (%s bytes)",
+                original_filename,
+                file_size,
+            )
+
+            # Extract text and create chunks.
+            result = extract_text(str(file_path))
+
+            text = result["text"]
+            chunks = result["chunks"]
+
+            logger.info(
+                "Text extraction completed: %s | Characters: %s | Chunks: %s",
+                original_filename,
+                len(text),
+                len(chunks),
+            )
+
+            if not chunks:
+                raise ValueError(
+                    "No text chunks could be extracted from the PDF."
+                )
+
+            # Create document metadata.
+            document = document_manager.add_document(
+                filename=original_filename,
+                filesize=file_size,
+                stored_filename=stored_filename,
+            )
+
+            # Add chunks to FAISS.
+            faiss_chunks_added = vector_store.add_document(
+                document_id=document["id"],
+                filename=original_filename,
+                chunks=chunks,
+            )
+
+            logger.info(
+                "FAISS indexing completed for %s: %s chunks added",
+                original_filename,
+                faiss_chunks_added,
+            )
+
+            uploaded_documents.append(
+                {
+                    "document": document,
+                    "characters": len(text),
+                    "chunks": len(chunks),
+                    "faiss_chunks_added": faiss_chunks_added,
+                    "preview": text[:500],
+                }
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Failed to process file: %s",
+                original_filename,
+            )
+
+            # Remove physical file if processing failed.
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception:
+                logger.exception(
+                    "Failed to remove incomplete file: %s",
+                    original_filename,
+                )
+
+            failed_documents.append(
+                {
+                    "filename": original_filename,
+                    "error": str(exc),
+                }
+            )
+    logger.info(
+        "Multiple upload completed. Success: %s | Failed: %s",
+        len(uploaded_documents),
+        len(failed_documents),
+    )
+
+    return {
+        "message": "Upload processing completed.",
+        "total_files": len(files),
+        "successful_files": len(uploaded_documents),
+        "failed_files": len(failed_documents),
+        "documents": uploaded_documents,
+        "failures": failed_documents,
+    }
+
+@app.post("/ask")
+async def ask_question(request: QuestionRequest):
+    logger.info(
+        "Received question: %s",
+        request.question,
+    )
+
+    # ============================================================
+    # SEARCH
+    # ============================================================
+    results = vector_store.search(
+        query=request.question,
+        top_k=5,
+    )
+
+    # ============================================================
+    # SIGNATURE QUESTION DOCUMENT FILTERING
+    # ============================================================
+    signature_keywords = [
+        "signatory",
+        "signatories",
+        "signature",
+        "signatures",
+        "signed",
+        "signed by",
+        "who signed",
+        "authorized signatory",
+        "authorised signatory",
+        "esign",
+        "e sign",
+    ]
+    normalized_question = request.question.lower()
+
+    is_signature_question = any(
+        keyword in normalized_question
+        for keyword in signature_keywords
+    )
+
+    if is_signature_question:
+        signature_results = [
+            result
+            for result in results
+            if result.get("signature_score", 0.0) > 0
+            and result.get("document_score", 0.0) > 0
+        ]
+
+        if signature_results:
+            selected = signature_results[:2]
+            selected_ids = {
+                result["vector_id"]
+                for result in selected
+            }
+            for result in results:
+                if len(selected) >= 4:
+                    break
+                if result["vector_id"] in selected_ids:
+                    continue
+                if result.get("document_score", 0.0) > 0:
+                    selected.append(result)
+            results = selected
+
+            logger.info(
+                "Signature-question filtering applied. "
+                "Remaining results: %s",
+                len(results),
+            )
+
+    # ============================================================
+    # NO RESULTS
+    # ============================================================
+    if not results:
+        return {
+            "question": request.question,
+            "answer": "Please upload PDF first.",
+            "sources": [],
+        }
+
+    # ============================================================
+    # LOG RETRIEVED CHUNKS
+    # ============================================================
+    logger.info(
+        "FAISS returned %s relevant chunks for question: %s",
+        len(results),
+        request.question,
+    )
+
+    # ============================================================
+    # BUILD GEMINI CONTEXT
+    # ============================================================
+    context_parts = []
+    for result in results:
+        context_parts.append(
+            f"""
+DOCUMENT:
+{result['filename']}
+CHUNK:
+{result['chunk_index']}
+RETRIEVAL RELEVANCE:
+{result.get('relevance_score', 0.0):.3f}
+SIGNATURE RELEVANCE:
+{result.get('signature_score', 0.0):.3f}
+CONTENT:
+{result['text']}
+"""
+       )
+    context = "\n\n====================\n\n".join(
+        context_parts
+    )
+
+    # ============================================================
+    # ASK GEMINI
+    # ============================================================
+    answer = ask_gemini(
+        context,
+        request.question,
+    )
+
+    # ============================================================
+    # SOURCES
+    # ============================================================
+    sources = []
+    for result in results:
+        sources.append(
+            {
+                "document_id": result.get("document_id"),
+                "filename": result.get("filename"),
+                "chunk_index": result.get("chunk_index"),
+                "text": result.get("text", ""),
+                "score": result.get("final_score", 0.0),
+            }
+        )
+
+    # ============================================================
+    # RESPONSE
+    # ============================================================
+    return {
+        "question": request.question,
+        "answer": answer,
+        "sources": sources,
+    }
+
+@app.get("/documents")
+def list_documents():
+    documents = document_manager.get_documents()
+    return {
+        "total_documents": len(documents),
+        "documents": documents,
+    }
+
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+
+    logger.info(
+        "Delete request received for document: %s",
+        document_id,
+    )
+
+    document = document_manager.delete_document(
+        document_id
+    )
+
+    if document is None:
+        logger.warning(
+            "Document not found for deletion: %s",
+            document_id,
+        )
+
+        return {
+            "success": False,
+            "message": "Document not found.",
+        }
+
+    filename = document["filename"]
+
+    stored_filename = document.get(
+        "stored_filename",
+        filename,
+    )
+
+    logger.info(
+        "Deleting RAG document: %s -> %s",
+        filename,
+        document_id,
+    )
+
+    # Remove vectors from FAISS.
+    faiss_deleted = vector_store.delete_document(
+        document_id
+    )   
+
+    logger.info(
+        "FAISS vectors removed for document %s: %s",
+        document_id,
+        faiss_deleted,
+    )
+
+    # Remove physical PDF.
+    file_path = UPLOAD_FOLDER / stored_filename
+
+    if file_path.exists():
+        try:
+            file_path.unlink()
+            logger.info(
+                "Physical PDF deleted: %s",
+                file_path,
+            )
+
+        except Exception as exc:
+            logger.error(
+                "Could not delete physical PDF %s: %s",
+                file_path,
+                exc,
+            )
+    else:
+        logger.warning(
+            "Physical PDF not found: %s",
+            file_path,
+        )
+
+    return {
+        "success": True,
+        "message": "Document deleted successfully.",
+        "document": document,
+        "faiss_vectors_deleted": faiss_deleted,
+    }
+
+@app.get("/auth/sso")
+async def sso_login():
+    raise HTTPException(
+        status_code=501,
+        detail="SSO login not implemented yet. Please use the demo login.",
+    )
+
+def custom_openapi():
+   if app.openapi_schema:
+       return app.openapi_schema
+   schema = get_openapi(
+       title=app.title,
+       version="1.0.0",
+       description="PDF RAG Backend API",
+       routes=app.routes,
+   )
+   components = schema.get("components", {}).get("schemas", {})
+   for component in components.values():
+       properties = component.get("properties", {})
+       for prop in properties.values():
+           # Array of uploaded files
+           if (
+               prop.get("type") == "array"
+               and isinstance(prop.get("items"), dict)
+           ):
+               items = prop["items"]
+               if items.get("contentMediaType") == "application/octet-stream":
+                   items.pop("contentMediaType", None)
+                   items["type"] = "string"
+                   items["format"] = "binary"
+           # Single uploaded file
+           elif (
+               prop.get("type") == "string"
+               and prop.get("contentMediaType") == "application/octet-stream"
+           ):
+               prop.pop("contentMediaType", None)
+               prop["format"] = "binary"
+   app.openapi_schema = schema
+   return app.openapi_schema
+
+app.openapi = custom_openapi
+
+//backend / routers / auth.py
+from fastapi import APIRouter, HTTPException
+
+from models.auth import LoginRequest
+from services.auth_service import auth_service
+
+router = APIRouter(
+    prefix="/auth",
+    tags=["Authentication"]
+)
+
+@router.post("/login")
+def login(request: LoginRequest):
+    user = auth_service.authenticate(username=request.username, password=request.password)
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    return {
+        "success": True,
+        "user": user
+    }
+
+//backend / services / auth_service.py
+class AuthService:
+    """
+    Temporary development authentication service. This will be replaced with a proper authentication service in the future:
+    - corporate SSO
+    - proper user identity validation
+    - secure session/token handling
+    """
+
+    DEMO_USERNAME = "admin"
+    DEMO_PASSWORD = "pass,123"
+
+    @classmethod
+    def authenticate(cls, username: str, password: str) :
+        username = username.strip()
+
+        if (
+            username != cls.DEMO_USERNAME
+            or password != cls.DEMO_PASSWORD
+        ):
+            return None
+
+        return {
+            "id": "demo-user",
+            "name": "Demo User",
+            "username": username,
+            "loginType": "form"
+        }
+
+auth_service = AuthService()
+
+//backend / models / auth.py
+from pydantic import BaseModel
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
