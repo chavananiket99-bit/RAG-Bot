@@ -1,0 +1,140 @@
+//layouts / MainLayout.jsx
+import { useState } from "react";
+import Header from "../components/Header";
+import Sidebar from "../components/Sidebar";
+export default function MainLayout({ children }) {
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const openMobileSidebar = () => {
+    setMobileSidebarOpen(true);
+  };
+  const closeMobileSidebar = () => {
+    setMobileSidebarOpen(false);
+  };
+  return (
+    <div className="flex h-screen overflow-hidden bg-slate-100">
+      {/* Sidebar */}
+      <Sidebar mobileOpen={mobileSidebarOpen} onClose={closeMobileSidebar} />
+      {/* Main application */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Header */}
+        <Header onMenuClick={openMobileSidebar} />
+        {/* Content */}
+        <main className="min-h-0 flex-1 overflow-y-auto">
+          <div className="min-h-full w-full">{children}</div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+
+//routes / AppRoutes.jsx
+import { BrowserRouter, Navigate, Routes, Route } from "react-router-dom";
+
+import Login from "../pages/Login";
+import Dashboard from "../pages/Dashboard";
+import Chat from "../pages/Chat";
+
+import MainLayout from "../layouts/MainLayout";
+import ProtectedRoute from "../components/ProtectedRoute";
+
+export default function AppRoutes() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<Navigate to="/login" replace />} />
+        <Route path="/login" element={<Login />} />
+        <Route
+          path="/dashboard"
+          element={
+            <ProtectedRoute>
+              <MainLayout>
+                <Dashboard />
+              </MainLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/chat"
+          element={
+            <ProtectedRoute>
+              <MainLayout>
+                <Chat />
+              </MainLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+//services /api.js
+import axios from "axios";
+
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+
+const api = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 120000,
+});
+
+export async function uploadPdf(files) {
+  const formData = new FormData();
+
+  Array.from(files).forEach((file) => {
+    formData.append("files", file);
+  });
+
+  const response = await api.post("/upload", formData);
+
+  return response.data;
+}
+
+export async function getDocuments() {
+  const response = await api.get("/documents");
+  return response.data;
+}
+
+export async function askQuestion(question) {
+  const response = await api.post("/ask", { question });
+
+  return response.data;
+}
+
+export { API_BASE_URL };
+
+export async function deleteDocument(documentId) {
+  const response = await api.delete(`/documents/${documentId}`);
+
+  return response.data;
+}
+
+//App.jsx
+import AppRoutes from "./routes/AppRoutes";
+
+export default function App() {
+  return <AppRoutes />;
+}
+
+//main.jsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+
+import "./index.css";
+import App from "./App.jsx";
+
+import { UploadProvider } from "./context/UploadContext.jsx";
+import { AuthProvider } from "./context/AuthContext.jsx";
+
+createRoot(document.getElementById("root")).render(
+  <StrictMode>
+    <AuthProvider>
+      <UploadProvider>
+        <App />
+      </UploadProvider>
+    </AuthProvider>
+  </StrictMode>,
+);
