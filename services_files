@@ -1,129 +1,65 @@
-//Header.jsx
-import { useState } from "react";
-import { Bell, ChevronDown, LogOut, Menu, UserRound } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+//backend/services/document_manager.py
+import json
+import uuid
+from pathlib import Path
+from datetime import datetime
 
-import { useAuth } from "../context/AuthContext";
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-export default function Header({ onMenuClick }) {
-  const [profileOpen, setProfileOpen] = useState(false);
-  const { user, logout } = useAuth();
-  const navigate = useNavigate();
+METADATA_DIR = BASE_DIR / "metadata"
+METADATA_FILE = METADATA_DIR / "documents.json"
 
-  const handleLogout = () => {
-    logout();
-    navigate("/login", { replace: true });
-  };
+class DocumentManager:
+    def __init__(self):
+        METADATA_DIR.mkdir(exist_ok=True)
 
-  return (
-    <header className="relative z-30 flex h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 shadow-sm md:px-6">
-      {/* Left section */}
-      <div className="flex items-center gap-3">
-        {/* Mobile menu */}
-        <button
-          type="button"
-          onClick={onMenuClick}
-          className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-600 transition hover:bg-slate-100 md:hidden"
-          aria-label="Open navigation"
-        >
-          <Menu size={21} />
-        </button>
-        {/* Mobile branding */}
-        <div className="flex items-center gap-2 md:hidden">
-          <img
-            src="/mahindra-logo.png"
-            alt="Mahindra"
-            className="h-8 w-8 object-contain"
-          />
-          <div className="leading-tight">
-            <p className="text-sm font-semibold text-slate-800">Mahindra AI</p>
-            <p className="text-[10px] text-slate-400">Knowledge Portal</p>
-          </div>
-        </div>
-        {/* Desktop page branding */}
-        <div className="hidden md:block">
-          <p className="text-sm font-semibold text-slate-800">
-            Enterprise AI Knowledge Assistant
-          </p>
-          <p className="text-xs text-slate-400">
-            Intelligent document knowledge platform
-          </p>
-        </div>
-      </div>
-      {/* Right section */}
-      <div className="flex items-center gap-2">
-        {/* Notifications */}
-        <button
-          type="button"
-          className="relative flex h-10 w-10 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
-          title="Notifications"
-        >
-          <Bell size={19} />
-          <span className="absolute right-2 top-2 h-2 w-2 rounded-full bg-red-600 ring-2 ring-white" />
-        </button>
-        {/* Divider */}
-        <div className="mx-1 hidden h-7 w-px bg-slate-200 sm:block" />
-        {/* Profile */}
-        <div className="relative">
-          <button
-            type="button"
-            onClick={() => setProfileOpen((prev) => !prev)}
-            className="flex items-center gap-2 rounded-xl px-2 py-1.5 transition hover:bg-slate-100"
-          >
-            {/* Avatar */}
-            <div className="flex h-9 w-9 items-center justify-center rounded-full bg-red-700 text-white">
-              <UserRound size={17} />
-            </div>
-            {/* User information */}
-            <div className="hidden text-left sm:block">
-              <p className="text-xs font-semibold text-slate-700">
-                {user?.name || "User"}
-              </p>
-              <p className="text-[10px] text-slate-400">
-                {user?.username || ""}
-              </p>
-            </div>
-            <ChevronDown
-              size={16}
-              className={`hidden text-slate-400 transition sm:block ${
-                profileOpen ? "rotate-180" : ""
-              }`}
-            />
-          </button>
-          {/* Dropdown */}
-          {profileOpen && (
-            <div className="absolute right-0 mt-2 w-56 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
-              {/* Profile header */}
-              <div className="border-b border-slate-100 px-4 py-3">
-                <p className="text-sm font-semibold text-slate-800">
-                  {user?.name || "User"}
-                </p>
-                <p className="mt-0.5 text-xs text-slate-400">
-                  {user?.username || ""}
-                </p>
-              </div>
-              {/* Profile option */}
-              <button
-                type="button"
-                className="flex w-full items-center gap-3 px-4 py-3 text-sm text-slate-600 transition hover:bg-slate-50"
-                onClick={() => setProfileOpen(false)}
-              >
-                <UserRound size={17} />
-                <span>My Profile</span>
-              </button>
-              {/* Logout */}
-              <button
-                type="button"
-                className="flex w-full items-center gap-3 border-t border-slate-100 px-4 py-3 text-sm text-red-600 transition hover:bg-red-50"
-                onClick={handleLogout}
-              >
-                <LogOut size={17} />
-                <span>Logout</span>
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
-    </header>
-  );
-}
+        if not METADATA_FILE.exists():
+            METADATA_FILE.write_text("[]", encoding='utf-8')
+
+    def get_documents(self):
+        with open(METADATA_FILE, 'r', encoding='utf-8') as file:
+            return json.load(file)
+
+    def save_documents(self, documents):
+        with open(METADATA_FILE, "w", encoding='utf-8') as file:
+            json.dump(documents, file, indent=4, ensure_ascii=False,)
+
+    def add_document(self, filename, filesize, stored_filename=None):
+        documents = self.get_documents()
+
+        document = {
+            "id": str(uuid.uuid4()),
+            "filename": filename,
+            "stored_filename": stored_filename or filename,
+            "filesize": filesize,
+            "uploaded_at": datetime.now().isoformat(),
+            "status": "Indexed"
+        }
+
+        documents.append(document)
+        self.save_documents(documents)
+        
+        return document
+
+    def delete_document(self, document_id):
+        documents = self.get_documents()
+        document_to_delete = None
+
+        for document in documents:
+            if document.get("id") == document_id:
+                document_to_delete = document
+                break
+
+        if document_to_delete is None:
+            return None
+
+        documents = [
+            document for document in documents if document.get("id") != document_id
+        ]
+
+        self.save_documents(documents)
+        return document_to_delete
+
+document_manager = DocumentManager()
+
+    
