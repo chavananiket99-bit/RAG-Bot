@@ -520,7 +520,7 @@ from pydantic import BaseModel
 class QuestionRequest(BaseModel):
     question: str
 
-//routes/auth.py
+//routers/auth.py
 from fastapi import APIRouter, HTTPException
 
 from models.auth import LoginRequest
@@ -542,3 +542,10 @@ def login(request: LoginRequest):
         "success": True,
         "user": user
     }
+
+//models/auth.py
+from pydantic import BaseModel
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
