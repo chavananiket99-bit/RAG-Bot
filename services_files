@@ -1,4 +1,4 @@
-//full vector_store.py file
+//backend / services / vector_store.py
 import json
 import logging
 import threading
@@ -960,7 +960,12 @@ class FAISSVectorStore:
         """
         Detect whether the query explicitly refers to
         a document/file name.
+        Supports common OCR/document aliases such as:
+            WH -> warehouse
+            WHS -> warehouse
+            OFF -> office
         """
+
         query_text = self._normalize_text(query)
         file_text = self._normalize_text(
             Path(filename).stem
@@ -968,39 +973,169 @@ class FAISSVectorStore:
 
         if not query_text or not file_text:
             return 0.0
-        query_tokens = set(
-            query_text.split()
-        )
-        file_tokens = set(
-            file_text.split()
-        )
-        if not file_tokens:
+
+        aliases = {
+            "wh": "warehouse",
+            "whs": "warehouse",
+            "warehouses": "warehouse",
+            "off": "office",
+            "offs": "office",
+            "offices": "office",
+        }
+
+        query_tokens = {
+            aliases.get(
+                token,
+                token
+            )
+            for token in query_text.split()
+        }
+        
+        file_tokens = {
+            aliases.get(
+                token,
+                token
+            )
+            for token in file_text.split()
+        }
+
+        generic_terms = {
+            "what",
+            "is",
+            "are",
+            "was",
+            "were",
+            "the",
+            "a",
+            "an",
+            "of",
+            "for",
+            "to",
+            "in",
+            "on",
+            "at",
+            "and",
+            "or",
+            "with",
+            "from",
+            "by",
+            "how",
+            "much",
+            "can",
+            "could",
+            "would",
+            "should",
+            "please",
+            "tell",
+            "me",
+            "agreement",
+            "document",
+            "file",
+            "pdf",
+        }
+
+        query_tokens -= generic_terms
+        file_tokens -= generic_terms
+
+        if not query_tokens or not file_tokens:
             return 0.0
         overlap = (
-            query_tokens.intersection(
-                file_tokens
+            query_tokens
+            .intersection(file_tokens)
+        )
+
+        if not overlap:
+            return 0.0
+
+        # Query coverage is more useful than filename coverage.
+        query_coverage = (
+            len(overlap)
+            / len(query_tokens)
+        )
+
+        # Strong distinctive document names such as:
+        # Nagpur, Pune, Mumbai, AD, etc.
+        distinctive_tokens = {
+            token
+            for token in file_tokens
+            if token not in {
+                "lp",
+                "wh",
+                "warehouse",
+                "office",
+                "space",
+            }
+            and not token.isdigit()
+        }
+
+        distinctive_overlap = (
+            overlap
+            .intersection(
+                distinctive_tokens
             )
         )
-        return (
-            len(overlap)
-            / len(file_tokens)
+
+        score = (
+            query_coverage * 0.70
+        )
+        if distinctive_overlap:
+            score += 0.30
+        return min(
+            1.0,
+            score
         )
 
     def _detect_target_documents(self, query):
         """
         Detect documents explicitly referenced by the user query.
-        Example:
+        
+        Examples:
             "Who signed the AD Inbound agreement?"
                 -> AD Inbound.pdf
             "Who signed the Nagpur LP WH agreement?"
                 -> Nagpur LP WH agreement 2024-2027.pdf
-        Generic words such as agreement/document/file are ignored.
+            "What is the rent of the Nagpur warehouse?"
+                -> Nagpur LP WH agreement 2024-2027.pdf
+        The detector supports common document/OCR abbreviations such as:
+            WH -> warehouse
+            WHS -> warehouse
+            OFF -> office
         """
+
         query_text = self._normalize_text(query)
+
         if not query_text:
             return set()
-       
-        query_tokens = set(query_text.split())
+
+        # ------------------------------------------------------------
+        # Query aliases
+        # ------------------------------------------------------------
+        query_aliases = {
+            "wh": "warehouse",
+            "whs": "warehouse",
+            "warehouses": "warehouse",
+            "off": "office",
+            "offs": "office",
+            "offices": "office",
+        }
+
+        query_tokens = set(
+            query_text.split()
+        )
+
+        normalized_query_tokens = set()
+
+        for token in query_tokens:
+            normalized_query_tokens.add(
+                query_aliases.get(
+                    token,
+                    token
+                )
+            )
+
+        # ------------------------------------------------------------
+        # Ignore generic document words
+        # ------------------------------------------------------------
         generic_filename_terms = {
             "agreement",
             "agreements",
@@ -1013,19 +1148,22 @@ class FAISSVectorStore:
             "contracts",
         }
 
+        # Also ignore years because they are not good
+        # document identifiers by themselves.
         query_tokens = {
             token
-            for token in query_tokens
+            for token in normalized_query_tokens
             if token not in generic_filename_terms
+            and not token.isdigit()
             and len(token) > 1
         }
 
         if not query_tokens:
             return set()
 
-        document_scores = {}
-
-        # Group metadata by document.
+        # ------------------------------------------------------------
+        # Group metadata by document
+        # ------------------------------------------------------------
         documents = {}
 
         for metadata in self.metadata.values():
@@ -1033,37 +1171,62 @@ class FAISSVectorStore:
                 "filename",
                 ""
             )
+
             if not filename:
                 continue
-            documents.setdefault(
-                filename,
-                set()
-            )
+
             filename_tokens = self._normalize_text(
                 Path(filename).stem
             ).split()
 
+            normalized_filename_tokens = set()
+
             for token in filename_tokens:
+                # Filename aliases
+                filename_aliases = {
+                    "wh": "warehouse",
+                    "whs": "warehouse",
+                    "warehouses": "warehouse",
+                    "off": "office",
+                    "offs": "office",
+                    "offices": "office",
+                }
+
+                normalized_token = filename_aliases.get(
+                    token,
+                    token
+                )
+
                 if (
-                    token not in generic_filename_terms
-                    and len(token) > 1
+                    normalized_token
+                    not in generic_filename_terms
+                    and not normalized_token.isdigit()
+                    and len(normalized_token) > 1
                 ):
-                    documents[filename].add(token)
+                    normalized_filename_tokens.add(
+                        normalized_token
+                    )
+            documents[filename] = (
+                normalized_filename_tokens
+            )
+        # ------------------------------------------------------------
+        # Score each document
+        # ------------------------------------------------------------
+        document_scores = {}
 
         for filename, filename_tokens in documents.items():
             if not filename_tokens:
                 continue
+
             overlap = (
-                query_tokens.intersection(
-                    filename_tokens
-                )
+                query_tokens
+                .intersection(filename_tokens)
             )
 
-            overlap_count = len(overlap)
-
-            if overlap_count == 0:
+            if not overlap:
                 continue
 
+            overlap_count = len(overlap)
             overlap_ratio = (
                 overlap_count
                 / len(filename_tokens)
@@ -1074,38 +1237,94 @@ class FAISSVectorStore:
                 / len(query_tokens)
             )
 
-            # Strong document reference:
+            # --------------------------------------------------------
+            # Distinctive document identifiers
             #
-            # AD + Inbound -> AD Inbound.pdf
-            # Nagpur + LP + WH -> Nagpur LP WH agreement...
-            if (
+            # A single strong identifier such as "Nagpur"
+            # should be enough to identify a document.
+            #
+            # Generic words such as "agreement", "document",
+            # "file", etc. have already been removed.
+            # --------------------------------------------------------
+            distinctive_tokens = {
+                token
+                for token in filename_tokens
+                if token not in {
+                    "lp",
+                    "wh",
+                    "warehouse",
+                    "office",
+                    "space",
+                }
+            }
+
+            distinctive_overlap = (
+                overlap
+                .intersection(
+                    distinctive_tokens
+                )
+            )
+
+            # --------------------------------------------------------
+            # Determine whether this is an explicit document match
+            # --------------------------------------------------------
+            is_strong_match = (
                 overlap_count >= 2
                 or overlap_ratio >= 0.50
                 or query_coverage >= 0.50
-            ):
-                document_scores[filename] = (
-                    overlap_count,
-                    overlap_ratio,
-                    query_coverage
-                )
+                or len(distinctive_overlap) >= 1
+            )
 
+            if not is_strong_match:
+                continue
+
+            # --------------------------------------------------------
+            # Ranking score
+            #
+            # Priority:
+            # 1. distinctive identifier
+            # 2. number of matching tokens
+            # 3. query coverage
+            # 4. filename coverage
+            # --------------------------------------------------------
+            distinctive_bonus = (
+                1.0
+                if distinctive_overlap
+                else 0.0
+            )
+
+            score = (
+                distinctive_bonus * 10.0
+                + overlap_count * 3.0
+                + query_coverage * 2.0
+                + overlap_ratio
+            )
+
+            document_scores[filename] = {
+                "score": score,
+                "overlap": overlap,
+                "overlap_count": overlap_count,
+                "overlap_ratio": overlap_ratio,
+                "query_coverage": query_coverage,
+                "distinctive_overlap": distinctive_overlap,
+            }
         if not document_scores:
             return set()
 
-        # Find the strongest document match.
+        # ------------------------------------------------------------
+        # Find strongest document match
+        # ------------------------------------------------------------
         best_score = max(
-            document_scores.values(),
-            key=lambda value: (
-                value[0],
-                value[1],
-                value[2]
-            )
+            item["score"]
+            for item in document_scores.values()
         )
 
         target_documents = {
             filename
-            for filename, score in document_scores.items()
-            if score == best_score
+            for filename, item in document_scores.items()
+            if abs(
+                item["score"] - best_score
+            ) < 0.000001
         }
 
         logger.info(
@@ -1398,8 +1617,7 @@ class FAISSVectorStore:
                 not in target_documents
             ):
                 logger.debug(
-                    "Exclude unrelated document: ",
-                    "%s | query=%s",
+                    "Exclude unrelated document: %s | query=%s",
                     result_metadata.get("filename"),
                     query
                 )
@@ -1442,7 +1660,13 @@ class FAISSVectorStore:
 
             document_reference_boost = 0.0
 
-            if document_score >= 0.50:
+            if (
+                has_explicit_document
+                and result["filename"] in target_documents
+            ):
+                document_reference_boost = 0.20
+
+            elif document_score >= 0.50:
                 document_reference_boost = 0.15
             elif document_score >= 0.25:
                 document_reference_boost = 0.08
@@ -1733,9 +1957,6 @@ class FAISSVectorStore:
             final_results,
             start=1
         ):
-            result["document_reference_boost"] = float(
-                document_reference_boost)
-            
             logger.info(
                 "RANK=%s FILE=%s CHUNK=%s "
                 "FINAL=%.6f FUSION=%.6f "
