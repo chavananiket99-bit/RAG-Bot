@@ -1,0 +1,57 @@
+//backend / services / pdf_reader.py
+from pypdf import PdfReader
+import logging
+
+
+logger = logging.getLogger("uvicorn.error")
+
+def read_pdf(file_path):
+    reader = PdfReader(file_path)
+
+    logger.info("Total pages in PDF: %s", len(reader.pages))
+
+    text = ""
+
+    for i, page in enumerate(reader.pages):
+        page_text = page.extract_text()
+        logger.info("--- Page %s ---", i + 1)
+        if page_text and page_text.strip():
+            logger.info("%s", page_text)
+        else:
+            logger.info("[No extractable text on this page]")
+        
+        if page_text:
+            text += page_text + "\n"
+
+    return text
+
+//backend / services / chunk_service.py
+import logging
+
+logger = logging.getLogger("uvicorn.error")
+
+def split_text(text, chunk_size=1000, overlap=200):
+    """
+    Split text into overlapping chunks.
+    """
+
+    if not text.strip():
+        return[]
+
+    chunks = []
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+        end = min(start + chunk_size, text_length)
+        chunks.append(text[start:end])
+
+        start += chunk_size - overlap
+
+    logger.info("Total chunks created: %s", len(chunks))
+
+    for index, chunk in enumerate(chunks):
+        logger.info("--- Chunk %s | Characters: %s ---", index + 1, len(chunk))
+        
+    return chunks
+
