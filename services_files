@@ -24,7 +24,7 @@ class DocumentManager:
         with open(METADATA_FILE, "w", encoding='utf-8') as file:
             json.dump(documents, file, indent=4, ensure_ascii=False,)
 
-    def add_document(self, filename, filesize, stored_filename=None):
+    def add_document(self, filename, filesize, stored_filename=None, user_id=None):
         documents = self.get_documents()
 
         document = {
@@ -33,7 +33,8 @@ class DocumentManager:
             "stored_filename": stored_filename or filename,
             "filesize": filesize,
             "uploaded_at": datetime.now().isoformat(),
-            "status": "Indexed"
+            "status": "Indexed",
+            "user_id": user_id
         }
 
         documents.append(document)
@@ -61,5 +62,7 @@ class DocumentManager:
         return document_to_delete
 
 document_manager = DocumentManager()
+
+    
 
     
