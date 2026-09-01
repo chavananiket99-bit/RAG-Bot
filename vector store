@@ -12,6 +12,7 @@ import numpy as np
 
 from services.embedding_service import embedding_service
 
+
 logger = logging.getLogger("uvicorn.error")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,118 +21,172 @@ INDEX_DIR = BASE_DIR / "indexes"
 FAISS_INDEX_FILE = INDEX_DIR / "faiss.index"
 METADATA_FILE = INDEX_DIR / "faiss_metadata.json"
 
-import re
+
+# ============================================================
+# SIGNATURE SCORE
+# ============================================================
 
 def calculate_signature_score(text):
     if not text:
         return 0.0
-    normalized = re.sub(r"\s+", " ", text).strip().lower()
-    # ---------------------------------------------------------
-    # Find positions of important signature markers
-    # ---------------------------------------------------------
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip().lower()
+
     behalf_matches = list(
         re.finditer(
             r"\bfor\s+and\s+on\s+behalf\s+of\b",
             normalized
         )
     )
+
     signature_matches = list(
         re.finditer(
             r"\bsignature\s*:",
             normalized
         )
     )
+
     name_matches = list(
         re.finditer(
             r"\bname\s*:",
             normalized
         )
     )
+
     title_matches = list(
         re.finditer(
             r"\btitle\s*:",
             normalized
         )
     )
-    # ---------------------------------------------------------
+
+    # --------------------------------------------------------
     # Actual signature block
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+
     for behalf in behalf_matches:
+
         behalf_pos = behalf.start()
+
         nearby_signature = any(
             abs(m.start() - behalf_pos) <= 500
             for m in signature_matches
         )
+
         nearby_name = any(
             abs(m.start() - behalf_pos) <= 500
             for m in name_matches
         )
+
         nearby_title = any(
             abs(m.start() - behalf_pos) <= 500
             for m in title_matches
         )
-        # Strongest evidence
+
         if nearby_signature and nearby_name:
             return 1.0
+
         if nearby_name and nearby_title:
             return 0.9
+
         if nearby_signature:
             return 0.75
+
         if nearby_name:
             return 0.7
-    # ---------------------------------------------------------
-    # Signed / delivered block
-    # ---------------------------------------------------------
+
+    # --------------------------------------------------------
+    # Signed / sealed / delivered
+    # --------------------------------------------------------
+
     if re.search(
         r"\bsigned\s+sealed\s+and\s+delivered\b",
         normalized
     ):
+
         if name_matches and signature_matches:
             return 0.95
+
         if name_matches:
             return 0.85
-    # ---------------------------------------------------------
+
+    # --------------------------------------------------------
     # Authorized signatory
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+
     if re.search(
         r"\bauthori[sz]ed\s+signatory\b",
         normalized
     ):
+
         if name_matches or signature_matches:
             return 0.85
+
         return 0.6
-    # ---------------------------------------------------------
-    # Signed by + name
-    # ---------------------------------------------------------
-    if re.search(r"\bsigned\s+by\b", normalized):
+
+    # --------------------------------------------------------
+    # Signed by
+    # --------------------------------------------------------
+
+    if re.search(
+        r"\bsigned\s+by\b",
+        normalized
+    ):
+
         if name_matches:
             return 0.8
+
         return 0.5
-    # ---------------------------------------------------------
-    # Electronic signature metadata
-    # ---------------------------------------------------------
-    if re.search(r"\besign\s+by\s+signdesk\b", normalized):
+
+    # --------------------------------------------------------
+    # Electronic signature
+    # --------------------------------------------------------
+
+    if re.search(
+        r"\besign\s+by\s+signdesk\b",
+        normalized
+    ):
+
         if signature_matches:
             return 0.6
+
         return 0.3
-    # ---------------------------------------------------------
+
+    # --------------------------------------------------------
     # Generic signature fields
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+
     if signature_matches and name_matches:
         return 0.5
+
     if signature_matches:
         return 0.2
+
     return 0.0
+
 
 class FAISSVectorStore:
 
+    # ========================================================
+    # INITIALIZATION
+    # ========================================================
+
     def __init__(self):
-        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+        INDEX_DIR.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
         self.lock = threading.Lock()
 
         self.dimension = (
-            embedding_service.model.get_embedding_dimension()
+            embedding_service.model
+            .get_embedding_dimension()
         )
 
         self.index = None
@@ -140,35 +195,27 @@ class FAISSVectorStore:
 
         self._load()
 
-    # ============================================================
-    # FAISS LOAD
-    # ============================================================
+    # ========================================================
+    # LOAD
+    # ========================================================
 
     def _load(self):
-        """
-        Load the FAISS index and metadata from disk.
-        
-        Ensures that:
-        - FAISS index exists and is loaded.
-        - Metadata exists and is loaded.
-        - next_vector_id never reuses an existing FAISS ID.
-        """
 
-        # ============================================================
-        # LOAD / CREATE FAISS INDEX
-        # ============================================================
         if FAISS_INDEX_FILE.exists():
+
             logger.info(
-                "Loading FAISS index from disk: %s",
+                "Loading FAISS index: %s",
                 FAISS_INDEX_FILE
             )
 
             try:
+
                 self.index = faiss.read_index(
                     str(FAISS_INDEX_FILE)
                 )
 
             except Exception as exc:
+
                 logger.exception(
                     "Failed to load FAISS index: %s",
                     exc
@@ -177,9 +224,12 @@ class FAISSVectorStore:
                 raise RuntimeError(
                     "FAISS index could not be loaded."
                 ) from exc
+
         else:
+
             logger.info(
-                "Creating a new FAISS index. Dimension: %s",
+                "Creating new FAISS index. "
+                "Dimension=%s",
                 self.dimension
             )
 
@@ -191,16 +241,20 @@ class FAISSVectorStore:
                 base_index
             )
 
-        # ============================================================
-        # LOAD METADATA
-        # ============================================================
+        # ----------------------------------------------------
+        # Metadata
+        # ----------------------------------------------------
+
         if METADATA_FILE.exists():
+
             try:
+
                 with open(
                     METADATA_FILE,
                     "r",
                     encoding="utf-8"
                 ) as file:
+
                     data = json.load(file)
 
                 self.metadata = data.get(
@@ -208,96 +262,93 @@ class FAISSVectorStore:
                     {}
                 )
 
-                stored_next_vector_id = data.get(
-                    "next_vector_id",
-                    1
-                )
                 self.next_vector_id = int(
-                    stored_next_vector_id
+                    data.get(
+                        "next_vector_id",
+                        1
+                    )
                 )
 
             except Exception as exc:
+
                 logger.exception(
                     "Failed to load FAISS metadata: %s",
                     exc
                 )
+
                 self.metadata = {}
                 self.next_vector_id = 1
+
         else:
-            logger.info(
-                "FAISS metadata file does not exist."
-            )
 
             self.metadata = {}
             self.next_vector_id = 1
-        # ============================================================
-        # SAFETY CHECK
-        #
-        # Never reuse an existing vector ID.
-        # ============================================================
+
+        # ----------------------------------------------------
+        # Never reuse an ID
+        # ----------------------------------------------------
+
         metadata_ids = []
+
         for vector_id in self.metadata.keys():
+
             try:
+
                 metadata_ids.append(
                     int(vector_id)
                 )
-            except (TypeError, ValueError):
+
+            except (
+                TypeError,
+                ValueError
+            ):
+
                 logger.warning(
-                    "Invalid vector ID found in metadata: %s",
+                    "Invalid vector ID: %s",
                     vector_id
                 )
+
         max_metadata_id = (
             max(metadata_ids)
             if metadata_ids
             else 0
         )
 
-        # ------------------------------------------------------------
-        # FAISS IndexIDMap2 stores explicit IDs.
-        #
-        # We use metadata IDs as the recoverable source of IDs.
-        # ------------------------------------------------------------
         self.next_vector_id = max(
             self.next_vector_id,
             max_metadata_id + 1,
             1
         )
 
-        # ============================================================
-        # CONSISTENCY LOGGING
-        # ============================================================
         logger.info(
             "FAISS vector count: %s",
             self.index.ntotal
         )
+
         logger.info(
             "FAISS metadata entries: %s",
             len(self.metadata)
         )
+
         logger.info(
             "Next FAISS vector ID: %s",
             self.next_vector_id
         )
 
-        # ============================================================
-        # BASIC CONSISTENCY WARNING
-        # ============================================================
         if self.index.ntotal != len(self.metadata):
+
             logger.warning(
                 "FAISS consistency warning: "
-                "index vectors=%s but metadata entries=%s",
+                "vectors=%s metadata=%s",
                 self.index.ntotal,
                 len(self.metadata)
             )
 
-    # ============================================================
+    # ========================================================
     # SAVE
-    # ============================================================
+    # ========================================================
 
     def _save(self):
-        """
-        Persist FAISS index and metadata to disk.
-        """
 
         temp_index_file = (
             FAISS_INDEX_FILE.with_suffix(".tmp")
@@ -314,7 +365,7 @@ class FAISSVectorStore:
 
         data = {
             "next_vector_id": self.next_vector_id,
-            "metadata": self.metadata
+            "metadata": self.metadata,
         }
 
         temp_metadata_file = (
@@ -338,9 +389,9 @@ class FAISSVectorStore:
             METADATA_FILE
         )
 
-    # ============================================================
+    # ========================================================
     # ADD DOCUMENT
-    # ============================================================
+    # ========================================================
 
     def add_document(
         self,
@@ -349,30 +400,63 @@ class FAISSVectorStore:
         chunks,
         user_id=None,
     ):
-        """
-        Add a document's chunks to the FAISS index.
-        """
 
         if not chunks:
             return 0
 
-        cleaned_chunks = [
-            chunk.strip()
-            for chunk in chunks
-            if chunk and chunk.strip()
-        ]
+        cleaned_chunks = []
+
+        for chunk in chunks:
+
+            if isinstance(chunk, dict):
+
+                chunk_text = str(
+                    chunk.get(
+                        "text",
+                        ""
+                    )
+                ).strip()
+
+                page_number = chunk.get(
+                    "page_number"
+                )
+
+            else:
+
+                chunk_text = str(
+                    chunk
+                ).strip()
+
+                page_number = None
+
+            if not chunk_text:
+                continue
+
+            cleaned_chunks.append(
+                {
+                    "text": chunk_text,
+                    "page_number": page_number,
+                }
+            )
 
         if not cleaned_chunks:
             return 0
 
+        chunk_texts = [
+            chunk["text"]
+            for chunk in cleaned_chunks
+        ]
+
         logger.info(
-            "Creating embedding for document: %s",
-            filename
+            "Creating embeddings for %s | chunks=%s",
+            filename,
+            len(chunk_texts)
         )
 
         embeddings = (
-            embedding_service.embed_documents(
-                cleaned_chunks
+            embedding_service
+            .embed_documents(
+                chunk_texts
             )
         )
 
@@ -390,7 +474,10 @@ class FAISSVectorStore:
                 cleaned_chunks
             ):
 
-                vector_id = self.next_vector_id
+                vector_id = (
+                    self.next_vector_id
+                )
+
                 self.next_vector_id += 1
 
                 vector_ids.append(
@@ -400,11 +487,26 @@ class FAISSVectorStore:
                 metadata_entries[
                     str(vector_id)
                 ] = {
-                    "document_id": document_id,
-                    "filename": filename,
-                    "chunk_index": index,
-                    "text": chunk,
-                    "user_id": user_id,
+
+                    "document_id":
+                        document_id,
+
+                    "filename":
+                        filename,
+
+                    "chunk_index":
+                        index,
+
+                    "page_number":
+                        chunk.get(
+                            "page_number"
+                        ),
+
+                    "text":
+                        chunk["text"],
+
+                    "user_id":
+                        user_id,
                 }
 
             ids = np.asarray(
@@ -424,50 +526,45 @@ class FAISSVectorStore:
             self._save()
 
         logger.info(
-            "Added %s chunks to FAISS for document %s",
+            "Added %s chunks to FAISS for %s",
             len(cleaned_chunks),
             document_id
         )
 
-        logger.info(
-            "Total vectors in FAISS: %s",
-            self.index.ntotal
-        )
-
         return len(cleaned_chunks)
 
-    # ============================================================
+    # ========================================================
     # TOKENIZER
-    # ============================================================
+    # ========================================================
 
     def _tokenize(self, text):
-        """
-        Normalize and tokenize text for lexical search.
-        Handles common OCR/document variations such as:
-        - & -> and
-        - hyphen/slash punctuation
-        - multiple spaces
-        - common rent/cost variations
-        """
 
         if not text:
             return []
 
         text = str(text).lower()
 
-        # Common document/OCR normalization
-        text = text.replace("&", " and ")
-        text = text.replace("/", " ")
-        text = text.replace("-", " ")
+        text = text.replace(
+            "&",
+            " and "
+        )
 
-        # Keep only alphanumeric characters and spaces
+        text = text.replace(
+            "/",
+            " "
+        )
+
+        text = text.replace(
+            "-",
+            " "
+        )
+
         text = re.sub(
             r"[^a-z0-9\s]",
             " ",
             text
         )
 
-        # Normalize whitespace
         text = re.sub(
             r"\s+",
             " ",
@@ -479,55 +576,47 @@ class FAISSVectorStore:
             text
         )
 
-        # Lightweight normalization
-        normalized_tokens = []
-
         aliases = {
+
             "rental": "rent",
             "renting": "rent",
             "rented": "rent",
+
             "prices": "price",
             "pricing": "price",
             "priced": "price",
+
             "costs": "cost",
             "costing": "cost",
+
             "charges": "charge",
             "charging": "charge",
+
             "amounts": "amount",
+
             "warehouses": "warehouse",
             "offices": "office",
             "spaces": "space",
         }
 
-        for token in tokens:
-            normalized_tokens.append(
-                aliases.get(
-                    token,
-                    token
-                )
+        return [
+            aliases.get(
+                token,
+                token
             )
-        return normalized_tokens
+            for token in tokens
+        ]
 
-    # ============================================================
+    # ========================================================
     # LEXICAL SEARCH
-    # ============================================================
+    # ========================================================
 
     def _lexical_search(
         self,
         query,
-        top_k=15,
+        top_k=20,
         user_id=None,
     ):
-        """
-        Lightweight BM25-style lexical search.
-
-        Useful for:
-        - names
-        - clause numbers
-        - dates
-        - exact terminology
-        - agreement names
-        """
 
         query_tokens = self._tokenize(
             query
@@ -538,13 +627,22 @@ class FAISSVectorStore:
 
         documents = []
 
-        for vector_id, metadata in self.metadata.items():
+        for vector_id, metadata in (
+            self.metadata.items()
+        ):
+
             if user_id is not None:
-                if metadata.get("user_id") != user_id:
+
+                if metadata.get(
+                    "user_id"
+                ) != user_id:
                     continue
 
             tokens = self._tokenize(
-                metadata.get("text", "")
+                metadata.get(
+                    "text",
+                    ""
+                )
             )
 
             if tokens:
@@ -649,10 +747,8 @@ class FAISSVectorStore:
                 term_score = (
                     idf
                     * (
-                        (
-                            term_frequency
-                            * (k1 + 1)
-                        )
+                        term_frequency
+                        * (k1 + 1)
                         / denominator
                     )
                 )
@@ -662,32 +758,34 @@ class FAISSVectorStore:
                     * query_count
                 )
 
-            if score > 0:
+            if score <= 0:
+                continue
 
-                metadata = self.metadata.get(
-                    str(vector_id)
-                )
+            metadata = self.metadata.get(
+                str(vector_id)
+            )
 
-                if metadata:
+            if not metadata:
+                continue
 
-                    scored_documents.append(
-                        {
-                            "score": float(score),
-                            "vector_id": vector_id,
-                            "document_id": metadata[
-                                "document_id"
-                            ],
-                            "filename": metadata[
-                                "filename"
-                            ],
-                            "chunk_index": metadata[
-                                "chunk_index"
-                            ],
-                            "text": metadata[
-                                "text"
-                            ]
-                        }
-                    )
+            scored_documents.append(
+                {
+                    "score": float(score),
+                    "vector_id": vector_id,
+                    "document_id":
+                        metadata["document_id"],
+                    "filename":
+                        metadata["filename"],
+                    "chunk_index":
+                        metadata["chunk_index"],
+                    "page_number":
+                        metadata.get(
+                            "page_number"
+                        ),
+                    "text":
+                        metadata["text"],
+                }
+            )
 
         scored_documents.sort(
             key=lambda x: x["score"],
@@ -696,15 +794,17 @@ class FAISSVectorStore:
 
         return scored_documents[:top_k]
 
-    # ============================================================
-    # FAISS SEARCH
-    # ============================================================
+    # ========================================================
+    # SEMANTIC SEARCH
+    # ========================================================
+
     def _semantic_search(
         self,
         query,
-        top_k=15,
+        top_k=20,
         user_id=None,
     ):
+
         query_embedding = (
             embedding_service.embed_text(
                 query
@@ -716,10 +816,16 @@ class FAISSVectorStore:
             dtype="float32"
         )
 
-        search_k = max(
-            top_k * 10,
-            100
+        search_k = min(
+            self.index.ntotal,
+            max(
+                top_k * 10,
+                100
+            )
         )
+
+        if search_k <= 0:
+            return []
 
         scores, vector_ids = (
             self.index.search(
@@ -734,6 +840,7 @@ class FAISSVectorStore:
             scores[0],
             vector_ids[0]
         ):
+
             if vector_id == -1:
                 continue
 
@@ -745,48 +852,69 @@ class FAISSVectorStore:
                 continue
 
             if user_id is not None:
-                if metadata.get("user_id") != user_id:
+
+                if metadata.get(
+                    "user_id"
+                ) != user_id:
                     continue
 
             results.append(
                 {
-                    "score": float(score),
-                    "vector_id": int(vector_id),
-                    "document_id": metadata[
-                        "document_id"
-                    ],
-                    "filename": metadata[
-                        "filename"
-                    ],
-                    "chunk_index": metadata[
-                        "chunk_index"
-                    ],
-                    "text": metadata[
-                        "text"
-                    ]
+                    "score":
+                        float(score),
+
+                    "vector_id":
+                        int(vector_id),
+
+                    "document_id":
+                        metadata["document_id"],
+
+                    "filename":
+                        metadata["filename"],
+
+                    "chunk_index":
+                        metadata["chunk_index"],
+
+                    "page_number":
+                        metadata.get(
+                            "page_number"
+                        ),
+
+                    "text":
+                        metadata["text"],
                 }
             )
+
             if len(results) >= top_k:
                 break
+
         return results
 
-    # ============================================================
-    # DOCUMENT / INTENT BOOSTING
-    # ============================================================
+    # ========================================================
+    # NORMALIZE TEXT
+    # ========================================================
+
     def _normalize_text(self, text):
-        """
-        Normalize text consistently for document/query matching.
-        """
 
         if not text:
             return ""
 
         text = str(text).lower()
 
-        # OCR/document normalization
-        text = text.replace("&", " and ")
-        text = text.replace("/", " ")
-        text = text.replace("-", " ")
+        text = text.replace(
+            "&",
+            " and "
+        )
+
+        text = text.replace(
+            "/",
+            " "
+        )
+
+        text = text.replace(
+            "-",
+            " "
+        )
 
         text = re.sub(
             r"[^a-z0-9\s]",
@@ -800,15 +928,19 @@ class FAISSVectorStore:
             text
         ).strip()
 
-        # Common vocabulary normalization
         replacements = {
+
             "rental": "rent",
             "renting": "rent",
             "rented": "rent",
+
             "prices": "price",
             "pricing": "price",
+
             "costs": "cost",
+
             "charges": "charge",
+
             "warehouses": "warehouse",
             "offices": "office",
             "spaces": "space",
@@ -816,7 +948,7 @@ class FAISSVectorStore:
 
         words = text.split()
 
-        normalized_words = [
+        words = [
             replacements.get(
                 word,
                 word
@@ -824,26 +956,32 @@ class FAISSVectorStore:
             for word in words
         ]
 
-        return " ".join(
-            normalized_words
-        )
+        return " ".join(words)
 
-    def _query_relevance_score(self, query, text):
-        """
-        Calculate robust lexical relevance between the user query
-        and a retrieved chunk.
-        Unlike simple token coverage, this method understands
-        business/document concepts and common OCR variations.
-        """
+    # ========================================================
+    # QUERY RELEVANCE
+    # ========================================================
+
+    def _query_relevance_score(
+        self,
+        query,
+        text
+    ):
 
         if not query or not text:
             return 0.0
 
-        normalized_query = self._normalize_text(query)
-        normalized_text = self._normalize_text(text)
+        normalized_query = (
+            self._normalize_text(
+                query
+            )
+        )
 
-        if not normalized_query or not normalized_text:
-            return 0.0
+        normalized_text = (
+            self._normalize_text(
+                text
+            )
+        )
 
         query_tokens = self._tokenize(
             normalized_query
@@ -856,41 +994,44 @@ class FAISSVectorStore:
         if not query_tokens or not text_tokens:
             return 0.0
 
-        text_token_set = set(text_tokens)
-
-        # ============================================================
-        # STOP WORDS
-        # ============================================================
         stopwords = {
+
             "what",
             "is",
             "are",
             "was",
             "were",
+
             "the",
             "a",
             "an",
+
             "of",
             "for",
             "to",
             "in",
             "on",
             "at",
+
             "and",
             "or",
             "with",
             "from",
             "by",
+
             "how",
             "much",
+
             "can",
             "could",
             "would",
             "should",
+
             "please",
             "tell",
             "me",
             "give",
+
             "according",
             "does",
             "do",
@@ -907,9 +1048,10 @@ class FAISSVectorStore:
         if not query_terms:
             return 0.0
 
-        # ============================================================
-        # DIRECT TOKEN MATCH
-        # ============================================================
+        text_token_set = set(
+            text_tokens
+        )
+
         matched_terms = sum(
             1
             for term in query_terms
@@ -921,12 +1063,13 @@ class FAISSVectorStore:
             / len(query_terms)
         )
 
-        # ============================================================
-        # BUSINESS CONCEPT MATCHING
-        # ============================================================
+        # ----------------------------------------------------
+        # Business concepts
+        # ----------------------------------------------------
+
         concept_groups = [
+
             {
-                "name": "cost",
                 "terms": {
                     "cost",
                     "price",
@@ -934,32 +1077,33 @@ class FAISSVectorStore:
                     "amount",
                     "charge",
                     "rent",
-                },
+                }
             },
+
             {
-                "name": "warehouse",
                 "terms": {
                     "warehouse",
-                },
+                }
             },
+
             {
-                "name": "office",
                 "terms": {
                     "office",
-                },
+                }
             },
+
             {
-                "name": "open_space",
                 "terms": {
                     "open",
                     "space",
-                },
+                }
             },
         ]
 
         query_concepts = []
 
         for concept in concept_groups:
+
             if any(
                 term in query_terms
                 for term in concept["terms"]
@@ -971,10 +1115,12 @@ class FAISSVectorStore:
         concept_matches = 0
 
         for concept in query_concepts:
+
             if any(
                 term in text_token_set
                 for term in concept["terms"]
             ):
+
                 concept_matches += 1
 
         concept_coverage = (
@@ -984,39 +1130,10 @@ class FAISSVectorStore:
             else 0.0
         )
 
-        # ============================================================
-        # PHRASE MATCHING
-        # ============================================================
-        phrase_bonus = 0.0
-        important_phrases = [
-            "open space",
-            "warehouse office",
-            "warehouse and office",
-            "rent of warehouse",
-            "warehouse rent",
-            "office rent",
-            "cost of rent",
-        ]
+        # ----------------------------------------------------
+        # Exact phrase
+        # ----------------------------------------------------
 
-        for phrase in important_phrases:
-            normalized_phrase = self._normalize_text(
-                phrase
-            )
-
-            if (
-                normalized_phrase
-                in normalized_text
-                and normalized_phrase
-                in normalized_query
-            ):
-                phrase_bonus = max(
-                    phrase_bonus,
-                    0.20
-                )
-
-        # ============================================================
-        # EXACT QUERY PHRASE
-        # ============================================================
         exact_phrase_bonus = 0.0
 
         if (
@@ -1025,15 +1142,50 @@ class FAISSVectorStore:
         ):
             exact_phrase_bonus = 0.30
 
-        # ============================================================
-        # FINAL RELEVANCE
-        # ============================================================
-        # Concept matching is deliberately stronger than
-        # individual-token matching because OCR/table extraction
-        # can split or alter wording.
+        # ----------------------------------------------------
+        # Important phrases
+        # ----------------------------------------------------
+
+        phrase_bonus = 0.0
+
+        important_phrases = [
+
+            "warehouse rent",
+            "rent of warehouse",
+            "warehouse rental",
+
+            "office rent",
+            "rent of office",
+
+            "cost of rent",
+            "rent amount",
+
+            "open space rent",
+        ]
+
+        for phrase in important_phrases:
+
+            normalized_phrase = (
+                self._normalize_text(
+                    phrase
+                )
+            )
+
+            if (
+                normalized_phrase
+                in normalized_query
+                and normalized_phrase
+                in normalized_text
+            ):
+
+                phrase_bonus = max(
+                    phrase_bonus,
+                    0.20
+                )
+
         relevance = (
-            (token_coverage * 0.40)
-            + (concept_coverage * 0.50)
+            token_coverage * 0.40
+            + concept_coverage * 0.50
             + phrase_bonus
             + exact_phrase_bonus
         )
@@ -1043,17 +1195,20 @@ class FAISSVectorStore:
             relevance
         )
 
-    def _document_hint_score(self, query, filename):
-        """
-        Detect whether the query explicitly refers to
-        a document/file name.
-        Supports common OCR/document aliases such as:
-            WH -> warehouse
-            WHS -> warehouse
-            OFF -> office
-        """
+    # ========================================================
+    # DOCUMENT HINT
+    # ========================================================
 
-        query_text = self._normalize_text(query)
+    def _document_hint_score(
+        self,
+        query,
+        filename
+    ):
+
+        query_text = self._normalize_text(
+            query
+        )
+
         file_text = self._normalize_text(
             Path(filename).stem
         )
@@ -1062,9 +1217,11 @@ class FAISSVectorStore:
             return 0.0
 
         aliases = {
+
             "wh": "warehouse",
             "whs": "warehouse",
             "warehouses": "warehouse",
+
             "off": "office",
             "offs": "office",
             "offices": "office",
@@ -1077,7 +1234,7 @@ class FAISSVectorStore:
             )
             for token in query_text.split()
         }
-        
+
         file_tokens = {
             aliases.get(
                 token,
@@ -1087,34 +1244,42 @@ class FAISSVectorStore:
         }
 
         generic_terms = {
+
             "what",
             "is",
             "are",
             "was",
             "were",
+
             "the",
             "a",
             "an",
+
             "of",
             "for",
             "to",
             "in",
             "on",
             "at",
+
             "and",
             "or",
             "with",
             "from",
             "by",
+
             "how",
             "much",
+
             "can",
             "could",
             "would",
             "should",
+
             "please",
             "tell",
             "me",
+
             "agreement",
             "document",
             "file",
@@ -1126,22 +1291,22 @@ class FAISSVectorStore:
 
         if not query_tokens or not file_tokens:
             return 0.0
+
         overlap = (
             query_tokens
-            .intersection(file_tokens)
+            .intersection(
+                file_tokens
+            )
         )
 
         if not overlap:
             return 0.0
 
-        # Query coverage is more useful than filename coverage.
         query_coverage = (
             len(overlap)
             / len(query_tokens)
         )
 
-        # Strong distinctive document names such as:
-        # Nagpur, Pune, Mumbai, AD, etc.
         distinctive_tokens = {
             token
             for token in file_tokens
@@ -1165,65 +1330,45 @@ class FAISSVectorStore:
         score = (
             query_coverage * 0.70
         )
+
         if distinctive_overlap:
             score += 0.30
+
         return min(
             1.0,
             score
         )
 
-    def _detect_target_documents(self, query, user_id=None):
-        """
-        Detect documents explicitly referenced by the user query.
-        
-        Examples:
-            "Who signed the AD Inbound agreement?"
-                -> AD Inbound.pdf
-            "Who signed the Nagpur LP WH agreement?"
-                -> Nagpur LP WH agreement 2024-2027.pdf
-            "What is the rent of the Nagpur warehouse?"
-                -> Nagpur LP WH agreement 2024-2027.pdf
-        The detector supports common document/OCR abbreviations such as:
-            WH -> warehouse
-            WHS -> warehouse
-            OFF -> office
-        """
+    # ========================================================
+    # TARGET DOCUMENT DETECTION
+    # ========================================================
 
-        query_text = self._normalize_text(query)
+    def _detect_target_documents(
+        self,
+        query,
+        user_id=None
+    ):
+
+        query_text = self._normalize_text(
+            query
+        )
 
         if not query_text:
             return set()
 
-        # ------------------------------------------------------------
-        # Query aliases
-        # ------------------------------------------------------------
-        query_aliases = {
+        aliases = {
+
             "wh": "warehouse",
             "whs": "warehouse",
             "warehouses": "warehouse",
+
             "off": "office",
             "offs": "office",
             "offices": "office",
         }
 
-        query_tokens = set(
-            query_text.split()
-        )
+        generic_terms = {
 
-        normalized_query_tokens = set()
-
-        for token in query_tokens:
-            normalized_query_tokens.add(
-                query_aliases.get(
-                    token,
-                    token
-                )
-            )
-
-        # ------------------------------------------------------------
-        # Ignore generic document words
-        # ------------------------------------------------------------
-        generic_filename_terms = {
             "agreement",
             "agreements",
             "document",
@@ -1235,12 +1380,22 @@ class FAISSVectorStore:
             "contracts",
         }
 
-        # Also ignore years because they are not good
-        # document identifiers by themselves.
+        query_tokens = set(
+            query_text.split()
+        )
+
+        query_tokens = {
+            aliases.get(
+                token,
+                token
+            )
+            for token in query_tokens
+        }
+
         query_tokens = {
             token
-            for token in normalized_query_tokens
-            if token not in generic_filename_terms
+            for token in query_tokens
+            if token not in generic_terms
             and not token.isdigit()
             and len(token) > 1
         }
@@ -1248,14 +1403,15 @@ class FAISSVectorStore:
         if not query_tokens:
             return set()
 
-        # ------------------------------------------------------------
-        # Group metadata by document
-        # ------------------------------------------------------------
         documents = {}
 
         for metadata in self.metadata.values():
+
             if user_id is not None:
-                if metadata.get("user_id") != user_id:
+
+                if metadata.get(
+                    "user_id"
+                ) != user_id:
                     continue
 
             filename = metadata.get(
@@ -1266,58 +1422,55 @@ class FAISSVectorStore:
             if not filename:
                 continue
 
-            filename_tokens = self._normalize_text(
-                Path(filename).stem
-            ).split()
+            filename_tokens = (
+                self._normalize_text(
+                    Path(filename).stem
+                ).split()
+            )
 
-            normalized_filename_tokens = set()
-
-            for token in filename_tokens:
-                # Filename aliases
-                filename_aliases = {
-                    "wh": "warehouse",
-                    "whs": "warehouse",
-                    "warehouses": "warehouse",
-                    "off": "office",
-                    "offs": "office",
-                    "offices": "office",
-                }
-
-                normalized_token = filename_aliases.get(
+            filename_tokens = {
+                aliases.get(
                     token,
                     token
                 )
+                for token in filename_tokens
+            }
 
-                if (
-                    normalized_token
-                    not in generic_filename_terms
-                    and not normalized_token.isdigit()
-                    and len(normalized_token) > 1
-                ):
-                    normalized_filename_tokens.add(
-                        normalized_token
-                    )
+            filename_tokens = {
+                token
+                for token in filename_tokens
+                if token not in generic_terms
+                and not token.isdigit()
+                and len(token) > 1
+            }
+
             documents[filename] = (
-                normalized_filename_tokens
+                filename_tokens
             )
-        # ------------------------------------------------------------
-        # Score each document
-        # ------------------------------------------------------------
+
         document_scores = {}
 
-        for filename, filename_tokens in documents.items():
+        for filename, filename_tokens in (
+            documents.items()
+        ):
+
             if not filename_tokens:
                 continue
 
             overlap = (
                 query_tokens
-                .intersection(filename_tokens)
+                .intersection(
+                    filename_tokens
+                )
             )
 
             if not overlap:
                 continue
 
-            overlap_count = len(overlap)
+            overlap_count = len(
+                overlap
+            )
+
             overlap_ratio = (
                 overlap_count
                 / len(filename_tokens)
@@ -1328,15 +1481,6 @@ class FAISSVectorStore:
                 / len(query_tokens)
             )
 
-            # --------------------------------------------------------
-            # Distinctive document identifiers
-            #
-            # A single strong identifier such as "Nagpur"
-            # should be enough to identify a document.
-            #
-            # Generic words such as "agreement", "document",
-            # "file", etc. have already been removed.
-            # --------------------------------------------------------
             distinctive_tokens = {
                 token
                 for token in filename_tokens
@@ -1356,9 +1500,6 @@ class FAISSVectorStore:
                 )
             )
 
-            # --------------------------------------------------------
-            # Determine whether this is an explicit document match
-            # --------------------------------------------------------
             is_strong_match = (
                 overlap_count >= 2
                 or overlap_ratio >= 0.50
@@ -1369,23 +1510,12 @@ class FAISSVectorStore:
             if not is_strong_match:
                 continue
 
-            # --------------------------------------------------------
-            # Ranking score
-            #
-            # Priority:
-            # 1. distinctive identifier
-            # 2. number of matching tokens
-            # 3. query coverage
-            # 4. filename coverage
-            # --------------------------------------------------------
-            distinctive_bonus = (
-                1.0
-                if distinctive_overlap
-                else 0.0
-            )
-
             score = (
-                distinctive_bonus * 10.0
+                (
+                    10.0
+                    if distinctive_overlap
+                    else 0.0
+                )
                 + overlap_count * 3.0
                 + query_coverage * 2.0
                 + overlap_ratio
@@ -1393,18 +1523,13 @@ class FAISSVectorStore:
 
             document_scores[filename] = {
                 "score": score,
-                "overlap": overlap,
-                "overlap_count": overlap_count,
-                "overlap_ratio": overlap_ratio,
-                "query_coverage": query_coverage,
-                "distinctive_overlap": distinctive_overlap,
+                "distinctive_overlap":
+                    distinctive_overlap,
             }
+
         if not document_scores:
             return set()
 
-        # ------------------------------------------------------------
-        # Find strongest document match
-        # ------------------------------------------------------------
         best_score = max(
             item["score"]
             for item in document_scores.values()
@@ -1412,330 +1537,604 @@ class FAISSVectorStore:
 
         target_documents = {
             filename
-            for filename, item in document_scores.items()
+            for filename, item
+            in document_scores.items()
             if abs(
-                item["score"] - best_score
+                item["score"]
+                - best_score
             ) < 0.000001
         }
 
         logger.info(
-            "Explicit document detection: query='%s' -> %s",
+            "Target documents for query='%s': %s",
             query,
             list(target_documents)
         )
+
         return target_documents
 
-    def _intent_score(self, query, text):
-        """
-        Boost chunks that match the intent of the question.
-        """
-        query_text = self._normalize_text(
+    # ========================================================
+    # INTENT
+    # ========================================================
+
+    def _detect_intent(self, query):
+
+        normalized = self._normalize_text(
             query
         )
-        chunk_text = self._normalize_text(
-            text
-        )
-        if not query_text or not chunk_text:
-            return 0.0
-        # --------------------------------------------------------
-        # Signatory / signature questions
-        # --------------------------------------------------------
-        signatory_terms = [
+
+        signature_terms = [
             "signatory",
             "signatories",
             "signature",
             "signatures",
             "signed",
+            "signed by",
+            "who signed",
+            "authorized signatory",
+            "authorised signatory",
             "esign",
             "e sign",
-            "authorized signatory",
-            "authorised signatory",
-            "witness whereof",
         ]
-        if any(
-            term in query_text
-            for term in signatory_terms
-        ):
-            matching_terms = 0
-            for term in signatory_terms:
-                if term in chunk_text:
-                    matching_terms += 1
-            if matching_terms:
-                return min(
-                    1.0,
-                    0.25
-                    * matching_terms
-                )
-        return 0.0
 
-    def _signature_score(self, query, text):
-        """
-        Detect chunks that are likely to contain
-        actual agreement signatories.
-        """
-        query_text = self._normalize_text(query)
-        chunk_text = self._normalize_text(text)
-        if not query_text or not chunk_text:
-            return 0.0
-        signatory_query_terms = [
-            "signatory",
-            "signatories",
-            "who signed",
-            "signed by",
-            "signature",
-            "signatures",
+        rent_terms = [
+            "rent",
+            "rental",
+            "price",
+            "cost",
+            "rate",
+            "amount",
+            "charge",
         ]
-        is_signature_question = any(
-            term in query_text
-            for term in signatory_query_terms
+
+        if any(
+            term in normalized
+            for term in signature_terms
+        ):
+            return "signature"
+
+        if any(
+            term in normalized
+            for term in rent_terms
+        ):
+            return "financial"
+
+        return "general"
+
+    # ========================================================
+    # INTENT SCORE
+    # ========================================================
+
+    def _intent_score(
+        self,
+        query,
+        text
+    ):
+
+        intent = self._detect_intent(
+            query
         )
-        if not is_signature_question:
+
+        normalized_text = (
+            self._normalize_text(
+                text
+            )
+        )
+
+        if intent == "signature":
+
+            terms = [
+                "signature",
+                "signatory",
+                "signed",
+                "signed by",
+                "authorized signatory",
+                "authorised signatory",
+                "esign",
+                "e sign",
+                "witness whereof",
+            ]
+
+            count = sum(
+                1
+                for term in terms
+                if term in normalized_text
+            )
+
+            return min(
+                1.0,
+                count * 0.20
+            )
+
+        if intent == "financial":
+
+            financial_terms = {
+                "rent",
+                "rental",
+                "price",
+                "cost",
+                "rate",
+                "amount",
+                "charge",
+                "monthly",
+                "annual",
+                "annum",
+                "lease",
+                "payment",
+                "payable",
+                "fee",
+            }
+
+            text_tokens = set(
+                self._tokenize(
+                    normalized_text
+                )
+            )
+
+            matched_terms = (
+                text_tokens.intersection(
+                    financial_terms
+                )
+            )
+
+            if not matched_terms:
+                return 0.0
+
+            return min(
+                1.0,
+                len(matched_terms) * 0.15
+            )
+
+    # ========================================================
+    # SIGNATURE SCORE
+    # ========================================================
+
+    def _signature_score(
+        self,
+        query,
+        text
+    ):
+
+        if (
+            self._detect_intent(query)
+            != "signature"
+        ):
             return 0.0
-        score = 0.0
-        # --------------------------------------------------------
-        # Strong signature indicators
-        # --------------------------------------------------------
-        signature_indicators = [
-            "esign by signdesk",
-            "electronic signature",
-            "electronic signing",
-            "signed",
-            "signature",
-            "signatory",
-            "authorized signatory",
-            "authorised signatory",
-            "in witness whereof",
-        ]
-        indicator_count = sum(
-            1
-            for term in signature_indicators
-            if term in chunk_text
-        )
-        score += min(
-            0.60,
-            indicator_count * 0.15
-        )
-        # --------------------------------------------------------
-        # Person-name pattern
-        #
-        # OCR commonly produces:
-        #
-        # Rakesh Sen Rakesh Sen
-        # Rampraveen Swaminathan
-        #
-        # We give a modest bonus to chunks containing
-        # multiple capitalized-name-like patterns.
-        # --------------------------------------------------------
-        import re
-        name_matches = re.findall(
-            r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b",
+
+        return calculate_signature_score(
             text
         )
-        unique_names = set(
-            name.strip()
-            for name in name_matches
+
+    # ============================================================
+    # FINANCIAL SCORE
+    # ============================================================
+    def _financial_score(
+        self,
+        query,
+        text
+    ):
+        """
+        Calculate financial relevance for financial questions.
+        
+        A chunk receives a meaningful financial score only when
+        it actually contains financial/rental terminology.
+        
+        Numbers alone are NOT treated as financial evidence.
+        Generic contract terms such as "lease", "payment",
+        "payable", and "fee" are deliberately excluded because
+        they can appear in non-financial/signature sections.
+        """
+
+        # --------------------------------------------------------
+        # Only apply this score to financial questions
+        # --------------------------------------------------------
+        if (
+            self._detect_intent(query)
+            != "financial"
+        ):
+            return 0.0
+        if not text:
+            return 0.0
+
+        # --------------------------------------------------------
+        # Normalize text and query
+        # --------------------------------------------------------
+        normalized = self._normalize_text(
+            text
         )
-        if len(unique_names) >= 2:
-            score += 0.40
-        elif len(unique_names) == 1:
-            score += 0.20
+
+        normalized_query = self._normalize_text(
+            query
+        )
+
+        if not normalized:
+            return 0.0
+
+        if not normalized_query:
+            return 0.0
+
+        # --------------------------------------------------------
+        # Financial terms
+        #
+        # Keep these focused on actual financial/rental concepts.
+        # Do NOT include generic terms such as:
+        # lease, payment, payable, fee
+        # because they may appear in unrelated contract sections.
+        # --------------------------------------------------------
+        financial_terms = {
+            "rent",
+            "rental",
+            "price",
+            "rate",
+            "cost",
+            "amount",
+            "charge",
+            "monthly",
+            "annual",
+            "annum",
+        }
+
+        # --------------------------------------------------------
+        # Tokenize document and query
+        # --------------------------------------------------------
+        text_tokens = set(
+            self._tokenize(
+                normalized
+            )
+        )
+
+        query_tokens = set(
+            self._tokenize(
+                normalized_query
+            )
+        )
+
+        if not text_tokens:
+            return 0.0
+
+        # --------------------------------------------------------
+        # Find financial terminology in the document chunk
+        # --------------------------------------------------------
+        financial_matches = (
+            text_tokens.intersection(
+                financial_terms
+            )
+        )
+
+        # --------------------------------------------------------
+        # CRITICAL:
+        #
+        # If the chunk contains NO financial terminology,
+        # its financial score MUST be zero.
+        #
+        # Therefore a signature/name/date-only chunk cannot
+        # receive financial points merely because it contains
+        # numbers.
+        # --------------------------------------------------------
+        
+        if not financial_matches:
+            return 0.0
+        score = 0.0
+
+        # --------------------------------------------------------
+        # Financial terminology
+        #
+        # Maximum contribution = 0.60
+        # --------------------------------------------------------
+        score += min(
+            0.60,
+            len(financial_matches) * 0.15
+        )
+
+        # --------------------------------------------------------
+        # Query-specific financial terminology
+        #
+        # Example:
+        #
+        # Query:
+        # "What is the rent of Nagpur Warehouse?"
+        #
+        # Query financial term:
+        # "rent"
+        #
+        # Chunk containing "rent":
+        # receives additional relevance.
+        # --------------------------------------------------------
+        query_financial_terms = (
+            query_tokens.intersection(
+                financial_terms
+            )
+        )
+
+        matching_query_financial_terms = (
+            financial_matches.intersection(
+                query_financial_terms
+            )
+        )
+
+        if matching_query_financial_terms:
+            score += min(
+                0.20,
+                len(
+                    matching_query_financial_terms
+                ) * 0.10
+            )
+
+        # --------------------------------------------------------
+        # Strong rental / financial phrases
+        # --------------------------------------------------------
+        strong_phrases = [
+            "warehouse rent",
+            "rent of warehouse",
+            "warehouse rental",
+            "monthly rent",
+            "rent per month",
+            "rent per annum",
+            "annual rent",
+            "rental amount",
+            "rental rate",
+            "rate applicable",
+            "rates applicable",
+        ]
+
+        for phrase in strong_phrases:
+            normalized_phrase = (
+                self._normalize_text(
+                    phrase
+                )
+            )
+
+            if (
+                normalized_phrase
+                in normalized
+            ):
+                score += 0.20
+                break
+
+        # --------------------------------------------------------
+        # Currency
+        #
+        # Currency is supporting evidence only.
+        # It cannot create a financial score by itself.
+        # --------------------------------------------------------
+        if re.search(
+            r"(₹|rs\.?|inr|\$|€|£)",
+            text,
+            re.IGNORECASE
+        ):
+            score += 0.15
+
+        # --------------------------------------------------------
+        # Amount-like number
+        #
+        # A number is deliberately given only a small contribution.
+        #
+        # Example:
+        #
+        # "Rent: ₹723,185 per month"
+        #
+        # already has "rent", so the number strengthens the score.
+        #
+        # A signature chunk containing only:
+        #
+        # "Name: ABC
+        # Date: 01/04/2024
+        # Signature: ..."
+        #
+        # still receives ZERO because it failed the
+        # financial_matches check above.
+        # --------------------------------------------------------
+        if re.search(
+            r"\b\d[\d,]*(?:\.\d+)?\b",
+            text
+        ):
+            score += 0.05
+
+        # --------------------------------------------------------
+        # Final score
+        # --------------------------------------------------------
         return min(
             1.0,
             score
         )
 
-    # ============================================================
+    # ========================================================
     # HYBRID SEARCH
-    # ============================================================
+    # ========================================================
+
     def search(
         self,
         query,
         top_k=5,
         user_id=None,
     ):
-        """
-        Improved hybrid retrieval.
-        Pipeline:
-        1. FAISS semantic retrieval
-        2. BM25-style lexical retrieval
-        3. Reciprocal Rank Fusion
-        4. Query relevance scoring
-        5. Intent/document/signature boosting
-        6. Weak-result filtering
-        7. Final top-K results
-        """
 
         if not query or not query.strip():
             return []
+
         if self.index.ntotal == 0:
             return []
 
-        normalized_query = self._normalize_text(query)
-
-        # ============================================================
-        # EXPLICIT DOCUMENT DETECTION
-        # ============================================================
-        target_documents = self._detect_target_documents(
-            query,
-            user_id=user_id,
+        intent = self._detect_intent(
+            query
         )
+
+        logger.info(
+            "RAG query intent: %s | query=%s",
+            intent,
+            query
+        )
+
+        target_documents = (
+            self._detect_target_documents(
+                query,
+                user_id=user_id
+            )
+        )
+
         has_explicit_document = bool(
             target_documents
         )
-        if has_explicit_document:
-            logger.info(
-                "Target document(s) detected: %s",
-                list(target_documents)
+
+        # ----------------------------------------------------
+        # Retrieve MORE candidates.
+        #
+        # This is particularly important for signature
+        # and financial questions.
+        # ----------------------------------------------------
+
+        candidate_k = 30
+
+        semantic_results = (
+            self._semantic_search(
+                query,
+                top_k=candidate_k,
+                user_id=user_id
             )
-        
-        signature_query_terms = [
-            "signatory",
-            "signatories",
-            "signature",
-            "signatures",
-            "signed",
-            "signed by",
-            "who signed",
-            "authorized signatory",
-            "authorised signatory",
-            "esign",
-            "e sign",
-        ]
-
-        is_signature_question = any(
-            term in normalized_query
-            for term in signature_query_terms
         )
 
-        # ============================================================
-        # 1. RETRIEVE MORE CANDIDATES
-        # ============================================================
-        semantic_results = self._semantic_search(
-            query,
-            top_k=20,
-            user_id=user_id
+        lexical_results = (
+            self._lexical_search(
+                query,
+                top_k=candidate_k,
+                user_id=user_id
+            )
         )
 
-        lexical_results = self._lexical_search(
-            query,
-            top_k=20,
-            user_id=user_id
-        )
+        # ----------------------------------------------------
+        # RRF
+        # ----------------------------------------------------
 
-        # ============================================================
-        # 2. RECIPROCAL RANK FUSION
-        # ============================================================
         fusion_scores = {}
         result_lookup = {}
 
         rrf_k = 60
 
-        # ------------------------------------------------------------
-        # Semantic results
-        # ------------------------------------------------------------
         for rank, result in enumerate(
             semantic_results,
             start=1
         ):
-            vector_id = result["vector_id"]
+
+            vector_id = result[
+                "vector_id"
+            ]
+
             fusion_scores.setdefault(
                 vector_id,
                 0.0
             )
-            fusion_scores[vector_id] += (
-                1.0 / (rrf_k + rank)
+
+            fusion_scores[
+                vector_id
+            ] += (
+                1.0
+                / (
+                    rrf_k + rank
+                )
             )
-            result_lookup[vector_id] = dict(
-                result
-            )
-            result_lookup[vector_id][
-                "semantic_score"
-            ] = float(
+
+            result_lookup[
+                vector_id
+            ] = dict(result)
+
+            result_lookup[
+                vector_id
+            ]["semantic_score"] = float(
                 result.get(
                     "score",
                     0.0
                 )
             )
 
-        # ------------------------------------------------------------
-        # ------------------------------------------------------------
-        # Lexical results
-        # ------------------------------------------------------------
         for rank, result in enumerate(
             lexical_results,
             start=1
         ):
-            vector_id = result["vector_id"]
+
+            vector_id = result[
+                "vector_id"
+            ]
+
             fusion_scores.setdefault(
                 vector_id,
                 0.0
             )
-            fusion_scores[vector_id] += (
-                1.0 / (rrf_k + rank)
+
+            fusion_scores[
+                vector_id
+            ] += (
+                1.0
+                / (
+                    rrf_k + rank
+                )
             )
 
             if vector_id not in result_lookup:
-                result_lookup[vector_id] = dict(
-                    result
-                )
-                result_lookup[vector_id][
-                    "semantic_score"
-                ] = 0.0
 
-            result_lookup[vector_id][
-                "lexical_score"
-            ] = float(
+                result_lookup[
+                    vector_id
+                ] = dict(result)
+
+                result_lookup[
+                    vector_id
+                ]["semantic_score"] = 0.0
+
+            result_lookup[
+                vector_id
+            ]["lexical_score"] = float(
                 result.get(
                     "score",
                     0.0
                 )
             )
-   
-        # ============================================================
-        # 3. BUILD CANDIDATES
-        # ============================================================
+
+        # ----------------------------------------------------
+        # Score candidates
+        # ----------------------------------------------------
+
         ranked_results = []
 
         for vector_id, fusion_score in (
             fusion_scores.items()
         ):
-            result_metadata = result_lookup.get(
+
+            result = result_lookup.get(
                 vector_id
             )
 
-            if not result_metadata:
+            if not result:
                 continue
+
+            filename = result.get(
+                "filename",
+                ""
+            )
+
+            # ------------------------------------------------
+            # Explicit document restriction
+            # ------------------------------------------------
 
             if (
                 has_explicit_document
-                and result_metadata.get("filename")
+                and filename
                 not in target_documents
             ):
-                logger.debug(
-                    "Exclude unrelated document: %s | query=%s",
-                    result_metadata.get("filename"),
-                    query
-                )
                 continue
 
-            result = dict(
-                result_lookup[vector_id]
-            )
-            result["fusion_score"] = float(
-                fusion_score
-            )
-            result.setdefault(
-                "semantic_score",
-                0.0
-            )
-            result.setdefault(
-                "lexical_score",
-                0.0
+            semantic_score = float(
+                result.get(
+                    "semantic_score",
+                    0.0
+                )
             )
 
-            # ========================================================
-            # QUERY RELEVANCE
-            # ========================================================
+            lexical_score = float(
+                result.get(
+                    "lexical_score",
+                    0.0
+                )
+            )
+
             relevance_score = (
                 self._query_relevance_score(
                     query,
@@ -1743,36 +2142,13 @@ class FAISSVectorStore:
                 )
             )
 
-            # ========================================================
-            # DOCUMENT NAME SCORE
-            # ========================================================
             document_score = (
                 self._document_hint_score(
                     query,
-                    result["filename"]
+                    filename
                 )
             )
 
-            document_reference_boost = 0.0
-
-            if (
-                has_explicit_document
-                and result["filename"] in target_documents
-            ):
-                document_reference_boost = 0.20
-
-            elif document_score >= 0.50:
-                document_reference_boost = 0.15
-            elif document_score >= 0.25:
-                document_reference_boost = 0.08
-
-            result["document_reference_boost"] = float(
-                document_reference_boost
-            )
-
-            # ========================================================
-            # INTENT SCORE
-            # ========================================================
             intent_score = (
                 self._intent_score(
                     query,
@@ -1780,144 +2156,161 @@ class FAISSVectorStore:
                 )
             )
 
-            # ========================================================
-            # SIGNATURE SCORE
-            # Only apply signature boosting when the user is
-            # actually asking about signatures/signatories.
-            # ========================================================
-            signature_query_terms = [
-                "signatory",
-                "signatories",
-                "signature",
-                "signatures",
-                "signed",
-                "signed by",
-                "who signed",
-                "authorized signatory",
-                "authorised signatory",
-                "esign",
-                "e sign",
-            ]
-            normalized_query = self._normalize_text(query)
-
-            is_signature_question = any(
-                term in normalized_query
-                for term in signature_query_terms
-            )
-
-            if is_signature_question:
-                signature_score = calculate_signature_score(
+            signature_score = (
+                self._signature_score(
+                    query,
                     result["text"]
                 )
-            else:
-                signature_score = 0.0
-
-            result["relevance_score"] = float(
-                relevance_score
-            )
-            result["document_score"] = float(
-                document_score
-            )
-            result["intent_score"] = float(
-                intent_score
-            )
-            result["signature_score"] = float(
-                signature_score
             )
 
-            # ========================================================
-            # FINAL SCORE
+            financial_score = (
+                self._financial_score(
+                    query,
+                    result["text"]
+                )
+            )
+
+            document_reference_boost = 0.0
+
+            if (
+                has_explicit_document
+                and filename
+                in target_documents
+            ):
+
+                document_reference_boost = 0.15
+
+            elif document_score >= 0.50:
+
+                document_reference_boost = 0.10
+
+            elif document_score >= 0.25:
+
+                document_reference_boost = 0.05
+
+            # ------------------------------------------------
+            # Final score
             #
-            # Semantic similarity is the primary signal.
-            # Lexical relevance supports exact business terminology.
-            # RRF is only a supporting signal.
-            # ========================================================
-            result["final_score"] = (
-                (
-                    result["semantic_score"]
-                    * 0.60
-                )
-                + (
-                    relevance_score
-                    * 0.20
-                )
-                + (
-                    result["fusion_score"]
-                    * 0.15
-                )
-                + (
-                    document_score
-                    * 0.03
-                )
-                + (
+            # IMPORTANT:
+            # Signature and financial intent are only strong
+            # when the question actually asks for them.
+            # ------------------------------------------------
+
+            final_score = (
+                semantic_score * 0.50
+                + relevance_score * 0.20
+                + fusion_score * 0.10
+                + document_score * 0.05
+                + document_reference_boost
+                + intent_score * 0.05
+                + signature_score * 0.05
+                + financial_score * 0.05
+            )
+
+            result["fusion_score"] = float(
+                fusion_score
+            )
+
+            result["semantic_score"] = (
+                semantic_score
+            )
+
+            result["lexical_score"] = (
+                lexical_score
+            )
+
+            result["relevance_score"] = (
+                float(relevance_score)
+            )
+
+            result["document_score"] = (
+                float(document_score)
+            )
+
+            result["document_reference_boost"] = (
+                float(
                     document_reference_boost
                 )
-                + (
-                    intent_score
-                    * 0.01
-                )
-                + (
-                    signature_score
-                    * 0.03
-                )
             )
 
-            if "Nagpur" in result["filename"]:
-                logger.info(
-                    "DEBUG NAGPUR: FILE=%s CHUNK=%s "
-                    "FINAL=%.6f FUSION=%.6f "
-                    "SEMANTIC=%.6f LEXICAL=%.6f "
-                    "RELEVANCE=%.3f DOC=%.3f "
-                    "DOC_BOOST=%.3f "
-                    "INTENT=%.3f SIGNATURE=%.3f",
+            result["intent_score"] = (
+                float(intent_score)
+            )
 
-                    result["filename"],
-                    result["chunk_index"],
-                    result["final_score"],
-                    result["fusion_score"],
-                    result["semantic_score"],
-                    result["lexical_score"],
-                    result["relevance_score"],
-                    result["document_score"],
-                    result.get(
-                        "document_reference_boost",
-                        0.0
-                    ),
-                    result["intent_score"],
-                    result["signature_score"]
-                )
+            result["signature_score"] = (
+                float(signature_score)
+            )
+
+            result["financial_score"] = (
+                float(financial_score)
+            )
+
+            result["final_score"] = (
+                float(final_score)
+            )
+
             ranked_results.append(
                 result
             )
 
-            if (
-                is_signature_question
-                and result["filename"] == "Nagpur LP WH agreement 2024-2027.pdf"
-            ):
-                logger.info(
-                    "\n==== SIGNATURE CHUNK DEBUG ====\n"
-                    "FILE: %s\n"
-                    "CHUNK: %s\n"
-                    "TEXT: %s\n"
-                    "================================",
-                    result["filename"],
-                    result["chunk_index"],
-                    result["text"]
-                )
+        # ----------------------------------------------------
+        # Sort
+        # ----------------------------------------------------
 
-        # ============================================================
-        # 4. SORT
-        # ============================================================
         ranked_results.sort(
-            key=lambda x: x["final_score"],
+            key=lambda x: x.get(
+                "final_score",
+                0.0
+            ),
             reverse=True
         )
 
-        # ============================================================
-        # 5. FILTER WEAK RESULTS
-        # ============================================================
+        # ----------------------------------------------------
+        # Intent-specific ranking
+        #
+        # This is the important part.
+        # ----------------------------------------------------
+
+        if intent == "signature":
+
+            ranked_results.sort(
+                key=lambda x: (
+                    x.get(
+                        "signature_score",
+                        0.0
+                    ),
+                    x.get(
+                        "final_score",
+                        0.0
+                    ),
+                ),
+                reverse=True
+            )
+
+        elif intent == "financial":
+
+            ranked_results.sort(
+                key=lambda x: (
+                    x.get(
+                        "financial_score",
+                        0.0
+                    ) * 0.60 +
+                    x.get(
+                        "relevance_score",
+                        0.0
+                    ) * 0.40
+                ),
+                reverse=True
+            )
+
+        # ----------------------------------------------------
+        # Weak result filtering
+        # ----------------------------------------------------
+
         filtered_results = []
+
         for result in ranked_results:
+
             relevance = result.get(
                 "relevance_score",
                 0.0
@@ -1933,11 +2326,6 @@ class FAISSVectorStore:
                 0.0
             )
 
-            fusion = result.get(
-                "fusion_score",
-                0.0
-            )
-
             final_score = result.get(
                 "final_score",
                 0.0
@@ -1948,100 +2336,96 @@ class FAISSVectorStore:
                 0.0
             )
 
-            intent_score = result.get(
-                "intent_score",
-                0.0
-            )
-
             signature_score = result.get(
                 "signature_score",
                 0.0
             )
 
-            document_reference_boost = result.get(
-                "document_reference_boost",
+            financial_score = result.get(
+                "financial_score",
                 0.0
             )
 
-            # --------------------------------------------------------
-            # Keep reasonably strong candidates.
-            #
-            # Do NOT require a very high score because a valid
-            # RAG answer may be distributed across multiple chunks.
-            # --------------------------------------------------------
-            keep_result = (
-                relevance >= 0.15
-                or semantic >= 0.30
-                or lexical >= 1.0
-                or final_score >= 0.30
-                or document_score >= 0.50
-                or signature_score >= 0.60
-                or intent_score >= 0.50
-                or document_reference_boost >= 0.10
-            )
+            if intent == "signature":
+
+                keep_result = (
+                    signature_score >= 0.20
+                    or relevance >= 0.15
+                    or semantic >= 0.30
+                    or document_score >= 0.50
+                )
+
+            elif intent == "financial":
+
+                keep_result = (
+                    financial_score >= 0.20
+                    or relevance >= 0.15
+                    or semantic >= 0.30
+                    or lexical >= 1.0
+                    or document_score >= 0.50
+                )
+
+            else:
+
+                keep_result = (
+                    relevance >= 0.15
+                    or semantic >= 0.30
+                    or lexical >= 1.0
+                    or final_score >= 0.30
+                    or document_score >= 0.50
+                )
 
             if keep_result:
+
                 filtered_results.append(
                     result
                 )
 
-            else:
-                logger.debug(
-                    "Filtered weak RAG result: %s | "
-                    "chunk=%s | final=%.3f | relevance=%.3f | "
-                    "semantic=%.3f | lexical=%.3f "
-                    "doc=%.3f | doc_boost=%.3f | "
-                    "intent=%.3f | signature=%.3f | fusion=%.6f",
-
-                    result["filename"],
-                    result["chunk_index"],
-                    final_score,
-                    relevance,
-                    semantic,
-                    lexical,
-                    document_score,
-                    document_reference_boost,
-                    intent_score,
-                    signature_score,
-                    fusion,
-                )   
-
-        # ============================================================
-        # 6. FALLBACK
-        # ============================================================
         if not filtered_results:
-            logger.warning(
-                "No results passed relevance filtering. "
-                "Returning strongest semantic candidates."
-            )
-            filtered_results = ranked_results[:top_k]
 
-        # ============================================================
-        # 7. DOCUMENT-DIVERSE FINAL RESULTS
-        #
-        # Allow up to 2 chunks for the same document while
-        # preventing a single document from dominating the
-        # final RAG context.
-        # ============================================================
-        final_results = self._apply_document_diversity(
-            filtered_results,
-            top_k=top_k,
-            max_per_document=2
-        )
-        
-        # ============================================================
-        # 8. LOGGING
-        # ============================================================
-        if has_explicit_document:
-            logger.info(
-                "Explicit document filtering applied. "
-                "Allowed documents: %s",
-                list(target_documents)
+            filtered_results = (
+                ranked_results[:top_k]
             )
+
+        # ----------------------------------------------------
+        # Document diversity
+        #
+        # Signature questions get more chunks because the
+        # signature evidence may span several pages.
+        # ----------------------------------------------------
+
+        if intent == "signature":
+
+            max_per_document = 4
+
+        elif (
+            has_explicit_document
+            and intent == "financial"
+        ):
+
+            max_per_document = 3
+
+        else:
+
+            max_per_document = 2
+
+        final_results = (
+            self._apply_document_diversity(
+                filtered_results,
+                top_k=top_k,
+                max_per_document=max_per_document
+            )
+        )
+
+        # ----------------------------------------------------
+        # Logging
+        # ----------------------------------------------------
 
         logger.info(
-            "Improved hybrid search: "
-            "semantic=%s lexical=%s candidates=%s final=%s",
+            "Hybrid search completed | "
+            "intent=%s | semantic=%s | lexical=%s | "
+            "candidates=%s | final=%s",
+            intent,
             len(semantic_results),
             len(lexical_results),
             len(ranked_results),
@@ -2052,274 +2436,34 @@ class FAISSVectorStore:
             final_results,
             start=1
         ):
-            logger.info(
-                "RANK=%s FILE=%s CHUNK=%s "
-                "FINAL=%.6f FUSION=%.6f "
-                "SEMANTIC=%.6f LEXICAL=%.6f "
-                "RELEVANCE=%.3f DOC=%.3f "
-                "DOC_BOOST=%.3f "
-                "INTENT=%.3f SIGNATURE=%.3f",
 
+            logger.info(
+                "RANK=%s FILE=%s PAGE=%s CHUNK=%s "
+                "FINAL=%.4f SEMANTIC=%.4f "
+                "LEXICAL=%.4f RELEVANCE=%.4f "
+                "DOC=%.4f INTENT=%.4f "
+                "SIGNATURE=%.4f FINANCIAL=%.4f",
                 rank,
                 result["filename"],
+                result.get(
+                    "page_number"
+                ),
                 result["chunk_index"],
                 result["final_score"],
-                result["fusion_score"],
                 result["semantic_score"],
                 result["lexical_score"],
                 result["relevance_score"],
                 result["document_score"],
-                result["document_reference_boost"],
                 result["intent_score"],
                 result["signature_score"],
+                result["financial_score"],
             )
+
         return final_results
 
-    # ============================================================
-    # DELETE DOCUMENT
-    # ============================================================
-    def delete_document(
-        self,
-        document_id
-    ):
-        """
-        Delete all FAISS vectors belonging to a document.
-        The operation keeps the FAISS index and FAISS metadata
-        synchronized.
-        Returns:
-        int: Number of deleted vectors.
-        """
-        if not document_id:
-            logger.warning(
-                "Delete requested without document_id."
-            )
-            return 0
-
-        with self.lock:
-            # ========================================================
-            # FIND ALL VECTOR IDS FOR DOCUMENT
-            # ========================================================
-            
-            vector_ids = []
-
-            for vector_id, metadata in self.metadata.items():
-                if metadata.get(
-                    "document_id"
-                ) == document_id:
-                    try:
-                        vector_ids.append(
-                            int(vector_id)
-                        )
-
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            "Invalid vector ID in metadata: %s",
-                            vector_id
-                    )
-
-            # ========================================================
-            # DOCUMENT HAS NO VECTORS
-            # ========================================================
-            if not vector_ids:
-                logger.info(
-                    "No FAISS vectors found for document: %s",
-                    document_id
-                )
-
-                return 0
-
-            logger.info(
-                "Deleting %s FAISS vectors for document: %s",
-                len(vector_ids),
-                document_id
-            )
-
-            # ========================================================
-            # REMOVE FROM FAISS
-            # ========================================================
-            ids = np.asarray(
-                vector_ids,
-                dtype="int64"
-            )
-
-            removed = self.index.remove_ids(
-                ids
-            )
-
-            removed = int(removed)
-
-            # ========================================================
-            # VERIFY FAISS DELETION
-            # ========================================================
-            expected_count = len(
-                vector_ids
-            )
-
-            if removed != expected_count:
-                logger.error(
-                    "FAISS deletion mismatch for document %s. "
-                    "Expected=%s Removed=%s",
-                    document_id,
-                    expected_count,
-                    removed
-                )
-
-                raise RuntimeError(
-                    "FAISS deletion consistency check failed."
-                )
-
-            # ========================================================
-            # REMOVE METADATA
-            # ========================================================
-            for vector_id in vector_ids:
-                self.metadata.pop(
-                    str(vector_id),
-                    None
-                )
-
-            # ========================================================
-            # VERIFY METADATA DELETION
-            # ========================================================
-            remaining_metadata_count = sum(
-                1
-                for metadata in self.metadata.values()
-                if metadata.get(
-                    "document_id"
-                ) == document_id
-            )
-
-            if remaining_metadata_count != 0:
-                logger.error(
-                    "FAISS metadata deletion incomplete for document: %s",
-                    document_id
-                )
-                raise RuntimeError(
-                    "FAISS metadata deletion consistency check failed."
-                )
-
-            # ========================================================
-            # PERSIST
-            # ========================================================
-            self._save()
-
-            # ========================================================
-            # FINAL VERIFICATION
-            # ========================================================
-            logger.info(
-                "Removed %s vectors for document: %s",
-                removed,
-                document_id
-            )
-
-            logger.info(
-                "Total vectors in FAISS after deletion: %s",
-                self.index.ntotal
-            )
-
-            logger.info(
-                "Total FAISS metadata entries after deletion: %s",
-                len(self.metadata)
-            )
-            return removed
-
-    # ============================================================
-    # DOCUMENT VECTOR COUNT
-    # ============================================================
-
-    def get_document_vector_count(
-        self,
-        document_id
-    ):
-
-        count = 0
-
-        for metadata in (
-            self.metadata.values()
-        ):
-
-            if metadata.get(
-                "document_id"
-            ) == document_id:
-
-                count += 1
-
-        return count
-
-    # ============================================================
-    # TOTAL VECTOR COUNT
-    # ============================================================
-
-    def get_total_vector_count(self):
-
-        return self.index.ntotal
-
-    # ============================================================
-    # CONSISTENCY CHECK
-    # ============================================================
-    def check_consistency(self):
-        """
-        Check whether FAISS vectors and FAISS metadata
-        are synchronized.
-        """
-        with self.lock:
-            metadata_vector_ids = set()
-            for vector_id in self.metadata.keys():
-                try:
-                    metadata_vector_ids.add(
-                        int(vector_id)
-                    )
-
-                except (TypeError, ValueError):
-                    pass
-            # ----------------------------------------------------
-            # FAISS vector count
-            # ----------------------------------------------------
-            faiss_count = int(
-                self.index.ntotal
-            )
-            metadata_count = len(
-                metadata_vector_ids
-            )
-
-            # ----------------------------------------------------
-            # Basic count check
-            # ----------------------------------------------------
-            count_match = (
-                faiss_count == metadata_count
-            )
-
-            # ----------------------------------------------------
-            # Check duplicate document IDs
-            # ----------------------------------------------------
-            document_counts = {}
-            for metadata in self.metadata.values():
-                document_id = metadata.get(
-                    "document_id"
-                )
-                if not document_id:
-                    continue
-
-                document_counts[document_id] = (
-                    document_counts.get(
-                        document_id,
-                        0
-                    ) + 1
-                )
-
-            # ----------------------------------------------------
-            # Result
-            # ----------------------------------------------------
-            consistent = count_match
-
-            return {
-                "consistent": consistent,
-                "faiss_vectors": faiss_count,
-                "metadata_entries": metadata_count,
-                "document_count": len(
-                    document_counts
-                ),
-                "document_vector_counts": document_counts,
-            }
+    # ========================================================
+    # DOCUMENT DIVERSITY
+    # ========================================================
 
     def _apply_document_diversity(
         self,
@@ -2327,40 +2471,274 @@ class FAISSVectorStore:
         top_k=5,
         max_per_document=2,
     ):
-        """
-        Prevent one document from occupying too many
-        positions in the final RAG context.
-        Results must already contain final_score.
-        """
 
         if not results:
             return []
 
-        # Highest scoring results first.
         ranked_results = sorted(
             results,
-            key=lambda item: item.get("final_score", 0.0),
-            reverse=True,
+            key=lambda item: item.get(
+                "final_score",
+                0.0
+            ),
+            reverse=True
         )
 
         selected = []
         document_counts = {}
 
         for result in ranked_results:
+
             filename = result.get(
                 "filename",
-                "unknown_document",
+                "unknown_document"
             )
 
-            count = document_counts.get(filename, 0)
+            count = document_counts.get(
+                filename,
+                0
+            )
 
             if count >= max_per_document:
                 continue
 
-            selected.append(result)
-            document_counts[filename] = count + 1
+            selected.append(
+                result
+            )
+
+            document_counts[
+                filename
+            ] = count + 1
+
             if len(selected) >= top_k:
                 break
+
         return selected
+
+    # ========================================================
+    # DELETE DOCUMENT
+    # ========================================================
+
+    def delete_document(
+        self,
+        document_id
+    ):
+
+        if not document_id:
+            return 0
+
+        with self.lock:
+
+            vector_ids = []
+
+            for vector_id, metadata in (
+                self.metadata.items()
+            ):
+
+                if metadata.get(
+                    "document_id"
+                ) == document_id:
+
+                    try:
+
+                        vector_ids.append(
+                            int(vector_id)
+                        )
+
+                    except (
+                        TypeError,
+                        ValueError
+                    ):
+
+                        logger.warning(
+                            "Invalid vector ID: %s",
+                            vector_id
+                        )
+
+            if not vector_ids:
+
+                logger.info(
+                    "No FAISS vectors found for document: %s",
+                    document_id
+                )
+
+                return 0
+
+            ids = np.asarray(
+                vector_ids,
+                dtype="int64"
+            )
+
+            removed = int(
+                self.index.remove_ids(
+                    ids
+                )
+            )
+
+            if removed != len(
+                vector_ids
+            ):
+
+                raise RuntimeError(
+                    "FAISS deletion consistency check failed."
+                )
+
+            for vector_id in vector_ids:
+
+                self.metadata.pop(
+                    str(vector_id),
+                    None
+                )
+
+            remaining = sum(
+                1
+                for metadata
+                in self.metadata.values()
+                if metadata.get(
+                    "document_id"
+                ) == document_id
+            )
+
+            if remaining != 0:
+
+                raise RuntimeError(
+                    "FAISS metadata deletion "
+                    "consistency check failed."
+                )
+
+            self._save()
+
+            logger.info(
+                "Deleted %s vectors for document %s",
+                removed,
+                document_id
+            )
+
+            return removed
+
+    # ========================================================
+    # DOCUMENT VECTOR COUNT
+    # ========================================================
+
+    def get_document_vector_count(
+        self,
+        document_id
+    ):
+
+        return sum(
+            1
+            for metadata
+            in self.metadata.values()
+            if metadata.get(
+                "document_id"
+            ) == document_id
+        )
+
+    # ========================================================
+    # TOTAL VECTOR COUNT
+    # ========================================================
+
+    def get_total_vector_count(self):
+
+        return self.index.ntotal
+
+    # ========================================================
+    # CONSISTENCY
+    # ========================================================
+
+    def check_consistency(
+        self,
+        user_id=None
+    ):
+
+        with self.lock:
+
+            if user_id is None:
+
+                relevant_metadata = (
+                    self.metadata.values()
+                )
+
+            else:
+
+                relevant_metadata = [
+                    metadata
+                    for metadata
+                    in self.metadata.values()
+                    if metadata.get(
+                        "user_id"
+                    ) == user_id
+                ]
+
+            metadata_count = len(
+                list(relevant_metadata)
+            )
+
+            faiss_count = int(
+                self.index.ntotal
+            )
+
+            # A user-specific FAISS count cannot be obtained
+            # directly from IndexIDMap2 without scanning IDs.
+            # Therefore only perform exact count comparison
+            # for the global consistency check.
+
+            if user_id is None:
+
+                consistent = (
+                    faiss_count
+                    == metadata_count
+                )
+
+            else:
+
+                consistent = True
+
+            document_counts = {}
+
+            for metadata in (
+                self.metadata.values()
+            ):
+
+                if user_id is not None:
+
+                    if metadata.get(
+                        "user_id"
+                    ) != user_id:
+                        continue
+
+                document_id = metadata.get(
+                    "document_id"
+                )
+
+                if not document_id:
+                    continue
+
+                document_counts[
+                    document_id
+                ] = (
+                    document_counts.get(
+                        document_id,
+                        0
+                    ) + 1
+                )
+
+            return {
+                "consistent": consistent,
+                "faiss_vectors": faiss_count,
+                "metadata_entries": (
+                    metadata_count
+                ),
+                "document_count": len(
+                    document_counts
+                ),
+                "document_vector_counts":
+                    document_counts,
+            }
+
+
+# ============================================================
+# GLOBAL VECTOR STORE
+# ============================================================
 
 vector_store = FAISSVectorStore()
