@@ -1,4 +1,4 @@
-//backend / services / vector_store.py
+//vector_store.py
 import json
 import logging
 import threading
@@ -1604,16 +1604,37 @@ class FAISSVectorStore:
     # ========================================================
     # INTENT SCORE
     # ========================================================
-
     def _intent_score(
         self,
         query,
         text
     ):
+        """
+        Calculate how strongly a chunk matches the detected
+        query intent.
+        IMPORTANT:
+        This function ALWAYS returns a float.
+        Previously, the function returned None for "general"
+        intent, which caused:
+            intent_score * 0.05
+        to raise:
+            TypeError:
+            unsupported operand type(s) for *:
+            'NoneType' and 'float'
+        """
 
+        # ----------------------------------------------------
+        # Detect query intent
+        # ----------------------------------------------------
         intent = self._detect_intent(
             query
         )
+
+        # ----------------------------------------------------
+        # Safety checks
+        # ----------------------------------------------------
+        if not query or not text:
+            return 0.0
 
         normalized_text = (
             self._normalize_text(
@@ -1621,8 +1642,13 @@ class FAISSVectorStore:
             )
         )
 
-        if intent == "signature":
+        if not normalized_text:
+            return 0.0
 
+        # ----------------------------------------------------
+        # SIGNATURE INTENT
+        # ----------------------------------------------------
+        if intent == "signature":
             terms = [
                 "signature",
                 "signatory",
@@ -1641,13 +1667,17 @@ class FAISSVectorStore:
                 if term in normalized_text
             )
 
-            return min(
-                1.0,
-                count * 0.20
+            return float(
+                min(
+                    1.0,
+                    count * 0.20
+                )
             )
 
+        # ----------------------------------------------------
+        # FINANCIAL INTENT
+        # ----------------------------------------------------
         if intent == "financial":
-
             financial_terms = {
                 "rent",
                 "rental",
@@ -1680,10 +1710,26 @@ class FAISSVectorStore:
             if not matched_terms:
                 return 0.0
 
-            return min(
-                1.0,
-                len(matched_terms) * 0.15
+            return float(
+                min(
+                    1.0,
+                    len(
+                        matched_terms
+                    ) * 0.15
+                )
             )
+
+        # ----------------------------------------------------
+        # GENERAL INTENT
+        #
+        # CRITICAL FIX:
+        #
+        # Previously this function reached the end here and
+        # implicitly returned None.
+        #
+        # Now it explicitly returns 0.0.
+        # ----------------------------------------------------
+        return 0.0
 
     # ========================================================
     # SIGNATURE SCORE
@@ -1715,18 +1761,16 @@ class FAISSVectorStore:
     ):
         """
         Calculate financial relevance for financial questions.
-        
-        A chunk receives a meaningful financial score only when
-        it actually contains financial/rental terminology.
-        
-        Numbers alone are NOT treated as financial evidence.
-        Generic contract terms such as "lease", "payment",
-        "payable", and "fee" are deliberately excluded because
-        they can appear in non-financial/signature sections.
+        The score is always a float between 0.0 and 1.0.
+        Financial scoring is applied only when the query intent
+        is financial.
+        Numbers alone are NOT considered financial evidence.
+        Generic contract terms such as lease, payment, payable,
+        and fee are intentionally excluded because they can occur
+        in non-financial sections.
         """
-
         # --------------------------------------------------------
-        # Only apply this score to financial questions
+        # Only apply financial scoring to financial questions
         # --------------------------------------------------------
         if (
             self._detect_intent(query)
@@ -1737,9 +1781,9 @@ class FAISSVectorStore:
             return 0.0
 
         # --------------------------------------------------------
-        # Normalize text and query
+        # Normalize query and document text
         # --------------------------------------------------------
-        normalized = self._normalize_text(
+        normalized_text = self._normalize_text(
             text
         )
 
@@ -1747,19 +1791,24 @@ class FAISSVectorStore:
             query
         )
 
-        if not normalized:
+        if not normalized_text:
             return 0.0
 
         if not normalized_query:
             return 0.0
 
         # --------------------------------------------------------
-        # Financial terms
+        # Financial terminology
         #
-        # Keep these focused on actual financial/rental concepts.
-        # Do NOT include generic terms such as:
-        # lease, payment, payable, fee
-        # because they may appear in unrelated contract sections.
+        # These are actual financial/rental concepts.
+        #
+        # Deliberately NOT including:
+        # lease
+        # payment
+        # payable
+        # fee
+        #
+        # because these can occur in unrelated contract sections.
         # --------------------------------------------------------
         financial_terms = {
             "rent",
@@ -1775,11 +1824,11 @@ class FAISSVectorStore:
         }
 
         # --------------------------------------------------------
-        # Tokenize document and query
+        # Tokenize
         # --------------------------------------------------------
         text_tokens = set(
             self._tokenize(
-                normalized
+                normalized_text
             )
         )
 
@@ -1793,7 +1842,7 @@ class FAISSVectorStore:
             return 0.0
 
         # --------------------------------------------------------
-        # Find financial terminology in the document chunk
+        # Financial terms found in document
         # --------------------------------------------------------
         financial_matches = (
             text_tokens.intersection(
@@ -1802,24 +1851,29 @@ class FAISSVectorStore:
         )
 
         # --------------------------------------------------------
-        # CRITICAL:
+        # CRITICAL SAFETY CHECK
         #
-        # If the chunk contains NO financial terminology,
-        # its financial score MUST be zero.
+        # If there are no actual financial terms in the chunk,
+        # financial score MUST be zero.
         #
-        # Therefore a signature/name/date-only chunk cannot
-        # receive financial points merely because it contains
-        # numbers.
+        # Therefore a chunk containing only:
+        #
+        # Name: ABC
+        # Date: 01/04/2024
+        # Signature: ...
+        #
+        # will NOT receive financial points merely because it
+        # contains numbers.
         # --------------------------------------------------------
-        
         if not financial_matches:
             return 0.0
+
         score = 0.0
 
         # --------------------------------------------------------
-        # Financial terminology
+        # Financial terminology score
         #
-        # Maximum contribution = 0.60
+        # Maximum = 0.60
         # --------------------------------------------------------
         score += min(
             0.60,
@@ -1837,8 +1891,8 @@ class FAISSVectorStore:
         # Query financial term:
         # "rent"
         #
-        # Chunk containing "rent":
-        # receives additional relevance.
+        # If the chunk also contains "rent", give additional
+        # relevance.
         # --------------------------------------------------------
         query_financial_terms = (
             query_tokens.intersection(
@@ -1861,7 +1915,7 @@ class FAISSVectorStore:
             )
 
         # --------------------------------------------------------
-        # Strong rental / financial phrases
+        # Strong financial/rental phrases
         # --------------------------------------------------------
         strong_phrases = [
             "warehouse rent",
@@ -1875,6 +1929,12 @@ class FAISSVectorStore:
             "rental rate",
             "rate applicable",
             "rates applicable",
+            "cost per month",
+            "cost per annum",
+            "monthly cost",
+            "annual cost",
+            "total cost",
+            "total costs",
         ]
 
         for phrase in strong_phrases:
@@ -1886,16 +1946,16 @@ class FAISSVectorStore:
 
             if (
                 normalized_phrase
-                in normalized
+                in normalized_text
             ):
                 score += 0.20
                 break
 
         # --------------------------------------------------------
-        # Currency
+        # Currency evidence
         #
-        # Currency is supporting evidence only.
-        # It cannot create a financial score by itself.
+        # Currency strengthens an already financial chunk.
+        # Currency by itself cannot create a financial score.
         # --------------------------------------------------------
         if re.search(
             r"(₹|rs\.?|inr|\$|€|£)",
@@ -1907,22 +1967,7 @@ class FAISSVectorStore:
         # --------------------------------------------------------
         # Amount-like number
         #
-        # A number is deliberately given only a small contribution.
-        #
-        # Example:
-        #
-        # "Rent: ₹723,185 per month"
-        #
-        # already has "rent", so the number strengthens the score.
-        #
-        # A signature chunk containing only:
-        #
-        # "Name: ABC
-        # Date: 01/04/2024
-        # Signature: ..."
-        #
-        # still receives ZERO because it failed the
-        # financial_matches check above.
+        # Small supporting contribution only.
         # --------------------------------------------------------
         if re.search(
             r"\b\d[\d,]*(?:\.\d+)?\b",
@@ -1932,10 +1977,14 @@ class FAISSVectorStore:
 
         # --------------------------------------------------------
         # Final score
+        #
+        # Always return a numeric float.
         # --------------------------------------------------------
-        return min(
-            1.0,
-            score
+        return float(
+            min(
+                1.0,
+                score
+            )
         )
 
     # ========================================================
