@@ -1,0 +1,608 @@
+# ============================================================
+# ASK
+# ============================================================
+
+@app.post("/ask")
+async def ask_question(
+    request: QuestionRequest,
+    current_user: dict = Depends(
+        get_current_user
+    ),
+):
+    question = (
+        request.question.strip()
+        if request.question
+        else ""
+    )
+
+    user_id = current_user["id"]
+
+    # ============================================================
+    # DOCUMENT RESOLUTION
+    # ============================================================
+    document_resolution = document_manager.resolve_document(
+        question,
+        user_id=user_id,
+    )
+    resolved_filename = (
+        document_resolution.get("filename")
+    )
+
+    # ========================================================
+    # VALIDATE QUESTION
+    # ========================================================
+    if not question:
+        return {
+            "question": question,
+            "answer":
+                "Please enter a question.",
+            "sources": [],
+            "conversation_id":
+                request.conversation_id,
+        }
+
+    # ========================================================
+    # GET CURRENT USER DOCUMENTS
+    #
+    # These are ALL documents currently uploaded by the user.
+    # They are stored separately from current_documents,
+    # which represents documents used by the latest answer.
+    # ========================================================
+    all_documents = (
+        document_manager
+        .get_documents()
+    )
+
+    user_documents = [
+        document
+        for document in all_documents
+        if document.get(
+            "user_id"
+        ) == user_id
+    ]
+
+    available_document_names = []
+
+    available_document_ids = []
+
+    for document in user_documents:
+        document_id = document.get(
+            "id"
+        )
+
+        filename = document.get(
+            "filename"
+        )
+
+        if (
+            document_id
+            and document_id
+            not in available_document_ids
+        ):
+            available_document_ids.append(
+                document_id
+            )
+
+        if (
+            filename
+            and filename
+            not in available_document_names
+        ):
+            available_document_names.append(
+                filename
+            )
+
+    logger.info(
+        "Available user documents | "
+        "user=%s | documents=%s",
+        user_id,
+        available_document_names,
+    )
+
+    # ========================================================
+    # GET OR CREATE CONVERSATION
+    # ========================================================
+    conversation = (
+        conversation_service
+        .get_or_create_conversation(
+            user_id=user_id,
+            conversation_id=(
+                request.conversation_id
+            ),
+            document_ids=(
+                available_document_ids
+            ),
+            document_names=(
+                available_document_names
+            ),
+        )
+    )
+
+    conversation_id = conversation[
+        "id"
+    ]
+
+    # ========================================================
+    # ALWAYS REFRESH AVAILABLE DOCUMENTS
+    #
+    # This is important because the user can upload another
+    # PDF after a conversation has already started.
+    #
+    # Example:
+    #
+    # Q1 -> Inbound.pdf uploaded
+    # Upload -> Outbound.pdf
+    # Q2 -> "What about the outbound one?"
+    #
+    # The existing conversation must now know about both.
+    # ========================================================
+    conversation_service.set_available_documents(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        document_ids=available_document_ids,
+        document_names=available_document_names,
+    )
+
+    logger.info(
+        "Conversation available documents updated | "
+        "conversation=%s | documents=%s",
+        conversation_id,
+        available_document_names,
+    )
+
+    logger.info(
+        "Received question: %s | "
+        "user=%s | conversation=%s",
+        question,
+        user_id,
+        conversation_id,
+    )
+
+    # ========================================================
+    # PREVIOUS CONVERSATION CONTEXT
+    # ========================================================
+    conversation_context = (
+        conversation_service.get_context(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+    )
+
+    last_question = (
+        conversation_context.get(
+            "last_question"
+        )
+    )
+
+    last_answer = (
+        conversation_context.get(
+            "last_answer"
+        )
+    )
+
+    current_documents = (
+        conversation_context.get(
+            "current_documents",
+            []
+        )
+    )
+
+    available_documents = (
+        conversation_context.get(
+            "available_documents",
+            []
+        )
+    )
+
+    logger.info(
+        "Conversation context | "
+        "conversation=%s | "
+        "last_question=%s | "
+        "last_answer=%s | "
+        "current_documents=%s | "
+        "available_documents=%s",
+        conversation_id,
+        last_question,
+        last_answer,
+        current_documents,
+        available_documents,
+    )
+
+    # ========================================================
+    # DETECT QUESTION TYPE
+    # ========================================================
+    normalized_question = (
+        question.lower()
+    )
+
+    # ========================================================
+    # FOLLOWUP DETECTION
+    # ========================================================
+    is_follow_up = _detect_follow_up_question(
+        question=question,
+        last_question=last_question,
+        last_answer=last_answer,
+        current_documents=current_documents,
+    )
+
+    # ========================================================
+    # EXPLICIT DOCUMENT REFERENCE
+    # ========================================================
+    explicit_document = _detect_explicit_document(
+        question=question,
+        available_documents=available_documents,
+    )
+
+    logger.info(
+        "Question Context detection | "
+        "conversation=%s | "
+        "is_follow_up=%s | "
+        "explicit_document=%s",
+        conversation_id,
+        is_follow_up,
+        explicit_document,
+    )
+
+    # ========================================================
+    # REWRITE FOLLOW-UP QUESTION
+    # ========================================================
+    rewritten_question = question
+    target_document = explicit_document
+
+    if is_follow_up:
+        rewrite_result = rewrite_followup_question(
+            question=question,
+            last_question=last_question,
+            last_answer=last_answer,
+            current_documents=available_documents,
+            explicit_document=explicit_document,
+        )
+
+        rewritten_question = (
+            rewrite_result.get(
+                "standalone_question",
+                question,
+            )
+            or question
+        )
+
+        target_document = (
+            rewrite_result.get(
+                "target_document"
+            )
+            or explicit_document
+        )
+
+        logger.info(
+            "Follow-up rewrite | "
+            "conversation=%s | "
+            "original=%s | "
+            "rewritten=%s | "
+            "target_document=%s",
+            conversation_id,
+            question,
+            rewritten_question,
+            target_document,
+        )
+    else:
+        logger.info(
+            "Question is standalone | question=%s",
+            question,
+        )
+
+    signature_keywords = [
+        "signatory",
+        "signatories",
+        "signature",
+        "signatures",
+        "signed",
+        "signed by",
+        "who signed",
+
+        "authorized signatory",
+        "authorised signatory",
+
+        "esign",
+        "e sign",
+    ]
+
+    is_signature_question = any(
+        keyword
+        in normalized_question
+        for keyword
+        in signature_keywords
+    )
+
+    # ========================================================
+    # RETRIEVE
+    #
+    # We request more results for signature questions because
+    # the actual signature block may be several chunks away.
+    # ========================================================
+    retrieval_k = (
+        8
+        if is_signature_question
+        else 5
+    )
+
+    results = vector_store.search(
+        query=rewritten_question,
+        top_k=retrieval_k,
+        user_id=user_id,
+    )
+
+    # ========================================================
+    # SIGNATURE RESULTS
+    #
+    # vector_store already performs signature-aware ranking.
+    # We only perform a conservative final ordering here.
+    # ========================================================
+    if is_signature_question:
+        signature_results = [
+            result
+            for result in results
+            if result.get(
+                "signature_score",
+                0.0
+            ) > 0
+        ]
+
+        if signature_results:
+            other_results = [
+                result
+                for result in results
+                if result
+                not in signature_results
+            ]
+
+            signature_results.sort(
+                key=lambda result: (
+                    result.get(
+                        "signature_score",
+                        0.0
+                    ),
+                    result.get(
+                        "final_score",
+                        0.0
+                    ),
+                ),
+                reverse=True
+            )
+
+            results = (
+                signature_results
+                + other_results
+            )
+
+            results = results[:4]
+
+            logger.info(
+                "Signature-aware result selection: %s",
+                len(results)
+            )
+
+    # ========================================================
+    # NO RESULTS
+    # ========================================================
+    if not results:
+        return {
+            "question":
+                question,
+
+            "answer":
+                "Please upload PDF first.",
+
+            "sources":
+                [],
+
+            "conversation_id":
+                conversation_id,
+        }
+
+    # ========================================================
+    # LOG RETRIEVED RESULTS
+    # ========================================================
+
+    logger.info(
+        "Retrieved %s relevant chunks for: %s",
+        len(results),
+        rewritten_question
+    )
+
+    for rank, result in enumerate(
+        results,
+        start=1
+    ):
+        logger.info(
+            "ASK RESULT %s | FILE=%s | PAGE=%s | "
+            "CHUNK=%s | FINAL=%.4f | "
+            "RELEVANCE=%.4f | SIGNATURE=%.4f | "
+            "FINANCIAL=%.4f",
+            rank,
+            result.get(
+                "filename"
+            ),
+            result.get(
+                "page_number"
+            ),
+            result.get(
+                "chunk_index"
+            ),
+            result.get(
+                "final_score",
+                0.0
+            ),
+            result.get(
+                "relevance_score",
+                0.0
+            ),
+            result.get(
+                "signature_score",
+                0.0
+            ),
+            result.get(
+                "financial_score",
+                0.0
+            ),
+        )
+
+    # ========================================================
+    # BUILD GEMINI CONTEXT
+    # ========================================================
+    context_parts = []
+
+    for result in results:
+        context_parts.append(
+            f"""
+DOCUMENT:
+{result.get("filename", "")}
+
+PAGE:
+{result.get("page_number", "Not specified")}
+
+CHUNK:
+{result.get("chunk_index", "Not specified")}
+
+RETRIEVAL RELEVANCE:
+{result.get("relevance_score", 0.0):.3f}
+
+SEMANTIC SCORE:
+{result.get("semantic_score", 0.0):.3f}
+
+LEXICAL SCORE:
+{result.get("lexical_score", 0.0):.3f}
+
+SIGNATURE RELEVANCE:
+{result.get("signature_score", 0.0):.3f}
+
+FINANCIAL RELEVANCE:
+{result.get("financial_score", 0.0):.3f}
+
+CONTENT:
+{result.get("text", "")}
+"""
+        )
+
+    context = (
+        "\n\n====================\n\n"
+        .join(context_parts)
+    )
+
+    # ========================================================
+    # GEMINI
+    # ========================================================
+    answer = ask_gemini(
+        context,
+        rewritten_question
+    )
+
+    # ========================================================
+    # STORE CONVERSATION MESSAGE
+    #
+    # For now the question is stored unchanged.
+    # Actual follow-up rewriting comes in the next step.
+    # ========================================================
+    conversation_service.add_message(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        question=question,
+        answer=answer,
+        rewritten_question=rewritten_question,
+        sources=results,
+    )
+
+    logger.info(
+        "Conversation message stored | "
+        "conversation=%s | question=%s",
+        conversation_id,
+        question,
+    )
+
+    # ========================================================
+    # SOURCES
+    # ========================================================
+    sources = []
+
+    for result in results:
+        sources.append(
+            {
+                "document_id":
+                    result.get(
+                        "document_id"
+                    ),
+
+                "filename":
+                    result.get(
+                        "filename"
+                    ),
+
+                "page_number":
+                    result.get(
+                        "page_number"
+                    ),
+
+                "chunk_index":
+                    result.get(
+                        "chunk_index"
+                    ),
+
+                "text":
+                    result.get(
+                        "text",
+                        ""
+                    ),
+
+                "score":
+                    result.get(
+                        "final_score",
+                        0.0
+                    ),
+
+                "relevance_score":
+                    result.get(
+                        "relevance_score",
+                        0.0
+                    ),
+
+                "semantic_score":
+                    result.get(
+                        "semantic_score",
+                        0.0
+                    ),
+
+                "lexical_score":
+                    result.get(
+                        "lexical_score",
+                        0.0
+                    ),
+
+                "signature_score":
+                    result.get(
+                        "signature_score",
+                        0.0
+                    ),
+
+                "financial_score":
+                    result.get(
+                        "financial_score",
+                        0.0
+                    ),
+            }
+        )
+
+    # ========================================================
+    # RESPONSE
+    # ========================================================
+    return {
+        "question":
+            question,
+
+        "answer":
+            answer,
+
+        "sources":
+            sources,
+
+        "conversation_id":
+            conversation_id,
+    }
