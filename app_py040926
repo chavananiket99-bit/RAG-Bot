@@ -988,6 +988,12 @@ async def ask_question(
         )
     )
 
+    current_document = (
+        conversation_context.get(
+            "current_document"
+        )
+    )
+
     available_documents = (
         conversation_context.get(
             "available_documents",
@@ -1048,8 +1054,9 @@ async def ask_question(
             question=question,
             last_question=last_question,
             last_answer=last_answer,
-            current_documents=available_documents,
+            current_documents=current_documents,
             explicit_document=explicit_document,
+            current_document=current_document,
         )
 
         rewritten_question = (
@@ -1060,12 +1067,37 @@ async def ask_question(
             or question
         )
 
-        target_document = (
+        rewrite_target_document = (
             rewrite_result.get(
                 "target_document"
             )
-            or explicit_document
         )
+
+        # ========================================================
+        # DOCUMENT TARGET PRIORITY
+        #
+        # 1. Explicit document in current question
+        # 2. Valid document returned by follow-up rewriter
+        # 3. Current conversation document
+        # ========================================================
+        if explicit_document:
+            target_document = explicit_document
+
+        elif (
+            rewrite_target_document
+            and rewrite_target_document
+            in available_documents
+        ):
+            target_document = rewrite_target_document
+
+        elif current_document:
+            target_document = current_document
+
+        elif current_documents:
+            target_document = current_documents[0]
+
+        else:
+            target_document = None
 
         logger.info(
             "Follow-up rewrite | "
