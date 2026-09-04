@@ -1,4 +1,6 @@
 //gemini_service.py
+from urllib import response
+
 import google.generativeai as genai
 import os
 import json
@@ -140,8 +142,42 @@ ANSWER:
        logger.info(
          "========== END GEMINI CONTEXT DEBUG =========="
        )
+
+       logger.info(
+         "========== GEMINI REQUEST =========="
+       )
+
+       logger.info(
+         "GEMINI QUESTION=%s",
+         question
+       )
+
+       logger.info(
+         "GEMINI CONTEXT LENGTH=%s",
+         len(context)
+       )
+
+       logger.info(
+         "GEMINI PROMPT LENGTH=%s",
+         len(prompt)
+       )
+
+       logger.info(
+         "========== END GEMINI REQUEST =========="
+       )
+
    response = model.generate_content(
        prompt
+   )
+   logger.info(
+    "========== GEMINI RESPONSE =========="
+   )
+   logger.info(
+    "GEMINI RESPONSE=%s",
+    response.text
+   )
+   logger.info(
+    "========== END GEMINI RESPONSE =========="
    )
    return response.text
 
