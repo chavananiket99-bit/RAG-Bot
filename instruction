@@ -1,0 +1,323 @@
+Key Takeaways
+
+1. Agreement Lifecycle Tracking
+
+The AI solution should:
+
+Capture agreement start date and tenure.
+Automatically calculate agreement end date.
+Determine whether an agreement is currently active.
+Provide alerts and notifications before agreement expiry.
+Display agreements nearing expiry in dashboards. [Agreements...d linkages | Meeting]
+2. Agreement Completeness Validation
+
+The solution should determine:
+
+Whether both parties have signed the agreement.
+Whether required signatures exist.
+Whether agreement execution is complete.
+The team discussed using the signature page and final pages of agreements as key indicators. [Agreements...d linkages | Meeting]
+
+3. Business Rationale Identification
+
+The chatbot should identify:
+
+Why parties entered into the agreement.
+The business justification and commercial intent.
+The strategic benefit of the transaction.
+The discussion clarified that this is different from transaction nature; the requirement is to identify the business need behind the agreement. [Agreements...d linkages | Meeting]
+
+4. Nature of Activities / Transactions
+
+The AI should classify and extract:[ >>]  @PAWASKAR PRATIK : Please guide on the transactions as captured in the RPT portal.
+
+Purchase transactions
+Sale transactions
+Service arrangements
+Design services
+Other transaction categories covered by the agreement
+The team noted that interpretation may be required because clauses may not always explicitly state the transaction category. [Agreements...d linkages | Meeting]
+
+5. Commercials and Pricing Mechanism
+
+The solution should identify:
+
+Pricing mechanisms
+Payment terms
+Cost structures
+Mark-up percentages
+Commercial clauses
+and make them easily searchable. [Agreements...d linkages | Meeting]
+
+6. Agreement Summarization
+
+The chatbot should create:
+
+Key-point summaries
+Executive summaries
+Condensed agreement overviews while retaining key terms and obligations. [Agreements...d linkages | Meeting]
+7. Query Management
+
+Users should be able to ask natural language questions against agreements and receive intelligent responses. [Agreements...d linkages | Meeting]
+
+8. Transfer Pricing (TP) Policy Validation
+
+A significant requirement discussed was:
+
+Upload TP policy documents.
+Compare agreements against TP policy guidance.
+Validate pricing methodologies.
+Check mark-up ranges against approved TP benchmarks.
+Highlight deviations. [Agreements...d linkages | Meeting]
+9. Agreement Comparison
+
+The system should compare multiple similar agreements and identify:
+
+Missing clauses
+Changes in terms
+Inconsistencies
+New clauses introduced in later agreements
+This could support agreement standardization across Mahindra entities. [Agreements...d linkages | Meeting]
+
+10. Compliance Monitoring & Dashboarding
+
+The solution should:
+
+Validate RPT-approved transactions against agreements.
+Highlight missing agreements.
+Highlight approved transactions not covered by agreements.
+Generate compliance dashboards.
+Track agreements requiring future actions such as actualization exercises. [Agreements...d linkages | Meeting]
+Action Items
+
+
+
+Action Item
+
+Owner
+
+Details
+
+Share sample agreements
+
+AGARWAL NEHA
+
+Provide representative agreements covering identified scenarios. [Agreements...d linkages | Meeting]
+
+Share TP policy and reference documents
+
+AGARWAL NEHA
+
+Provide TP policy and RPT approval documents used as master reference documents. [Agreements...d linkages | Meeting]
+
+Assess feasibility of requirements
+
+GUJARATHI MAYURI and team
+
+Evaluate which requirements are feasible, partially feasible, or require additional development. [Agreements...d linkages | Meeting]
+
+Explore multiple AI solution approaches
+
+GUJARATHI MAYURI
+
+Review existing products and alternate implementation approaches. [Agreements...d linkages | Meeting]
+
+Engage AI team
+
+MAKWANA AVINASH
+
+Bring AI implementation team into discussions from the early stages. [Agreements...d linkages | Meeting]
+
+Build initial POC approach
+
+Project Team
+
+Use sample documents and requirements to develop POC logic and validation. [Agreements...d linkages | Meeting]
+
+Create recurring working discussions
+
+Project Team
+
+Establish ongoing review sessions for requirements and progress. [Agreements...d linkages | Meeting]
+
+Review PAN-related master data requirement separately
+
+MAKWANA AVINASH and Team
+
+Schedule a separate discussion. [Agreements...d linkages | Meeting]
+
+Business Case for AI Chatbot POC
+
+Based on the meeting discussion, the business case is:
+
+Current Challenges
+
+Large number of agreements requiring manual review.
+No centralized visibility of agreement expiry and renewals.
+Manual validation of RPT compliance.
+Manual comparison of agreements.
+Manual TP policy validation.
+Risk of missing actualization and compliance obligations.
+Significant effort spent reviewing legal, commercial, and tax clauses. [Agreements...d linkages | Meeting]
+Proposed AI Solution
+
+An enterprise AI assistant capable of:
+
+Reading agreements.
+Extracting contractual metadata.
+Summarizing agreements.
+Comparing agreements.
+Validating TP and RPT compliance.
+Generating dashboards and alerts.
+Enabling conversational search and analysis. [Agreements...d linkages | Meeting]
+Expected Business Benefits
+
+Compliance
+
+Improved RPT governance.
+Reduced risk of uncovered transactions.
+Better agreement monitoring. [Agreements...d linkages | Meeting]
+Productivity
+
+Significant reduction in manual agreement review.
+Faster legal, finance, and tax assessment.
+Faster onboarding of new agreements. [Agreements...d linkages | Meeting]
+Risk Management
+
+Reduced missed renewals.
+Reduced missed actualization requirements.
+Improved contractual governance. [Agreements...d linkages | Meeting]
+Strategic Value
+
+The meeting highlighted that such a solution could become a highly visible and impactful corporate-level AI initiative because comparable solutions were not readily available through existing tools explored by the team. [Agreements...d linkages | Meeting]
+
+Recommended POC Test Cases
+
+The following test cases are directly derived from the requirements discussed during the meeting.
+
+Test Case 1: Agreement Expiry Detection
+
+Input: Agreement with effective date and 5-year tenure.
+
+Expected Output:
+
+Start date extracted.
+End date calculated.
+Agreement status displayed as Active/Expired.
+Renewal alert generated. [Agreements...d linkages | Meeting]
+Test Case 2: Signature Validation
+
+Input: Agreement signed by only one party.
+
+Expected Output:
+
+Signature status identified.
+Missing counter-signature flagged. [Agreements...d linkages | Meeting]
+Test Case 3: Agreement Summary
+
+Input: 10-page agreement.
+
+Expected Output:
+
+One-page executive summary.
+Key obligations.
+Commercial highlights.
+Important dates and conditions extracted. [Agreements...d linkages | Meeting]
+Test Case 4: Business Purpose Extraction
+
+Input: Service agreement.
+
+Expected Output:
+
+Purpose of agreement identified.
+Business rationale summarized.
+Strategic objective captured. [Agreements...d linkages | Meeting]
+Test Case 5: Nature of Transaction Detection
+
+Input: Various agreement types.
+
+Expected Output:
+
+Sale of goods.
+Service agreement.
+Contract manufacturing.
+Royalty.
+Procurement service.
+Classification should be generated automatically. [Agreements...d linkages | Meeting]
+
+Test Case 6: Commercial Clause Extraction
+
+Input: Agreement containing pricing and mark-up clauses.
+
+Expected Output:
+
+Payment terms extracted.
+Pricing methodology extracted.
+Mark-up identified. [Agreements...d linkages | Meeting]
+Test Case 7: TP Policy Validation
+
+Input:
+
+Agreement.
+TP Policy Document.
+Expected Output:
+
+Transaction type matched.
+Approved mark-up range identified.
+Agreement mark-up compared.
+Variances highlighted. [Agreements...d linkages | Meeting]
+Test Case 8: Agreement Comparison
+
+Input: Three similar manufacturing agreements.
+
+Expected Output:
+
+Clause comparison matrix.
+Missing clauses identified.
+Differences highlighted. [Agreements...d linkages | Meeting]
+Test Case 9: RPT Coverage Validation
+
+Input:
+
+RPT approval master Excel.
+Agreement repository.
+Expected Output:
+
+Missing agreements identified.
+Missing transaction coverage identified.
+Gap report generated. [Agreements...d linkages | Meeting]
+Test Case 10: Actualization Monitoring
+
+Input: Agreement containing annual actualization requirement.
+
+Expected Output:
+
+Actualization obligation detected.
+Dashboard alert generated.
+Due date tracked. [Agreements...d linkages | Meeting]
+Test Case 11: Conversational Query
+
+User Question:
+
+"Show agreements expiring in next 90 days."
+
+Expected Output:
+
+Relevant agreements listed with expiry dates. [Agreements...d linkages | Meeting]
+Test Case 12: Compliance Dashboard
+
+Input: Complete repository of agreements.
+
+Expected Output:
+
+Dashboard containing:
+
+Active agreements
+Expiring agreements
+Missing agreements
+Agreements requiring actualization
+RPT coverage gaps
+TP compliance exceptions [Agreements...d linkages | Meeting]
+These 12 test cases closely align with the POC scope discussed and would provide comprehensive validation of the AI agreement-management chatbot envisioned in the meeting. [Agreements...d linkages | Meeting]
+
+ 
