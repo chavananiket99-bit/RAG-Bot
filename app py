@@ -19,13 +19,14 @@ import os
 import time
 import logging
 import uuid
+import re
 
 from pathlib import Path
 
 from services.pdf_service import extract_text
 from models.question import QuestionRequest
 from services.vector_store import vector_store
-from services.gemini_service import ask_gemini
+from services.gemini_service import ( ask_gemini, rewrite_followup_question )
 from services.document_manager import document_manager
 from services.auth_dependency import get_current_user
 from services.conversation_service import conversation_service
@@ -84,6 +85,371 @@ UPLOAD_FOLDER.mkdir(
     parents=True,
     exist_ok=True
 )
+
+# ============================================================
+# CONVERSATION FOLLOW-UP HELPERS
+# ============================================================
+def _normalize_document_name(filename):
+    """
+    Normalize a document filename for comparison.
+    """
+    if not filename:
+       return ""
+
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        Path(filename).stem.lower(),
+    ).strip()
+
+def _document_reference_score(
+    question,
+    filename,
+):
+    """
+    Determine whether the question explicitly refers
+    to a particular uploaded document.
+    This is deterministic and does not use Gemini.
+    """
+    if not question or not filename:
+        return 0.0
+
+    question_text = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        question.lower(),
+    ).strip()
+
+    filename_text = _normalize_document_name(
+        filename
+    )
+
+    if not question_text or not filename_text:
+        return 0.0
+
+    question_tokens = set(
+        question_text.split()
+    )
+
+    filename_tokens = set(
+        filename_text.split()
+    )
+
+    if not question_tokens or not filename_tokens:
+        return 0.0
+
+    # --------------------------------------------------------
+    # Common aliases
+    # --------------------------------------------------------
+    aliases = {
+        "wh": "warehouse",
+        "whs": "warehouse",
+        "warehouses": "warehouse",
+        "off": "office",
+        "offs": "office",
+        "offices": "office",
+        "out": "outbound",
+        "in": "inbound",
+    }
+
+    question_tokens = {
+        aliases.get(
+            token,
+            token
+        )
+        for token in question_tokens
+    }
+
+    filename_tokens = {
+        aliases.get(
+            token,
+            token
+        )
+        for token in filename_tokens
+    }
+
+    # --------------------------------------------------------
+    # Ignore generic words
+    # --------------------------------------------------------
+    generic_terms = {
+        "what",
+        "is",
+        "are",
+        "was",
+        "were",
+        "the",
+        "a",
+        "an",
+        "of",
+        "for",
+        "to",
+        "in",
+        "on",
+        "at",
+        "and",
+        "or",
+        "with",
+        "from",
+        "by",
+        "how",
+        "much",
+        "about",
+        "this",
+        "that",
+        "one",
+        "document",
+        "file",
+        "pdf",
+        "same",
+        "also",
+        "please",
+        "tell",
+        "me",
+    }
+
+    question_tokens -= generic_terms
+    filename_tokens -= generic_terms
+
+    if not question_tokens or not filename_tokens:
+        return 0.0
+
+    overlap = (
+        question_tokens
+        .intersection(
+            filename_tokens
+        )
+    )
+    if not overlap:
+        return 0.0
+
+    # --------------------------------------------------------
+    # Score
+    # --------------------------------------------------------
+    query_coverage = (
+        len(overlap)
+        / len(question_tokens)
+    )
+
+    filename_coverage = (
+        len(overlap)
+        / len(filename_tokens)
+    )
+
+    score = (
+        query_coverage * 0.60
+        + filename_coverage * 0.40
+    )
+
+    return min(
+        1.0,
+        float(score)
+    )
+
+def _detect_explicit_document(
+    question,
+    available_documents,
+):
+    """
+    Find an explicitly referenced document.
+    Returns:
+        filename or None
+    """
+
+    if not question:
+        return None
+
+    if not available_documents:
+        return None
+
+    scored_documents = []
+
+    for filename in available_documents:
+        score = _document_reference_score(
+            question,
+            filename,
+        )
+
+        if score <= 0:
+            continue
+
+        scored_documents.append(
+            (
+                score,
+                filename,
+            )
+        )
+
+    if not scored_documents:
+        return None
+
+    scored_documents.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    best_score, best_filename = (
+        scored_documents[0]
+    )
+
+    # Require meaningful document overlap.
+    if best_score < 0.40:
+        return None
+
+    # Avoid ambiguous matches.
+    if len(scored_documents) > 1:
+        second_score = (
+            scored_documents[1][0]
+        )
+
+        if (
+            abs(
+                best_score
+                - second_score
+            )
+            < 0.10
+        ):
+           return None
+
+    logger.info(
+        "Explicit document detected | "
+        "question=%s | document=%s | score=%.3f",
+        question,
+        best_filename,
+        best_score,
+    )
+
+    return best_filename
+
+def _detect_follow_up_question(
+    question,
+    last_question=None,
+    last_answer=None,
+    current_documents=None,
+):
+    """
+    Conservative follow-up detection.
+    Returns True only when the new question appears to
+    depend on the previous conversation.
+    """
+    if not question:
+        return False
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        question.lower(),
+    ).strip()
+
+    if not normalized:
+        return False
+
+    # --------------------------------------------------------
+    # Explicit follow-up phrases
+    # --------------------------------------------------------
+    follow_up_patterns = [
+        r"\bwhat about\b",
+        r"\bhow about\b",
+        r"\band the\b",
+        r"\band for\b",
+        r"\band what about\b",
+        r"\bwhat of\b",
+        r"\bthe other one\b",
+        r"\bthe other document\b",
+        r"\bthe second one\b",
+        r"\bthe first one\b",
+        r"\bthis one\b",
+        r"\bthat one\b",
+        r"\bsame for\b",
+        r"\bsame as\b",
+        r"\bwhat about its\b",
+        r"\bwhat about their\b",
+        r"\band the same\b",
+    ]
+
+    if any(
+        re.search(
+            pattern,
+            normalized,
+        )
+        for pattern in follow_up_patterns
+    ):
+        return bool(
+            last_question
+            or last_answer
+            or current_documents
+        )
+
+    # --------------------------------------------------------
+    # Pronoun/reference-based short questions
+    # --------------------------------------------------------
+    reference_words = {
+        "it",
+        "its",
+        "they",
+        "their",
+        "them",
+        "that",
+        "this",
+        "one",
+        "same",
+        "other",
+    }
+
+    tokens = set(
+        re.findall(
+            r"\b[a-z0-9]+\b",
+            normalized,
+        )
+    )
+
+    if (
+        tokens.intersection(
+            reference_words
+        )
+        and (
+            last_question
+            or last_answer
+            or current_documents
+        )
+    ):
+        return True
+
+    # --------------------------------------------------------
+    # Very short questions following an existing question
+    #
+    # Examples:
+    #
+    # "And the rate?"
+    # "And renewal?"
+    # "The duration?"
+    # --------------------------------------------------------
+    question_tokens = re.findall(
+        r"\b[a-z0-9]+\b",
+        normalized,
+    )
+
+    if (
+        last_question
+        and len(question_tokens) <= 5
+    ):
+        follow_up_starters = {
+            "and",
+            "also",
+            "then",
+            "what",
+            "how",
+            "the",
+            "about",
+        }
+
+        if (
+            question_tokens
+            and question_tokens[0]
+            in follow_up_starters
+        ):
+            return True
+
+    return False
 
 
 # ============================================================
@@ -455,20 +821,134 @@ async def ask_question(
         get_current_user
     ),
 ):
-
-    question = request.question.strip()
-    user_id = current_user["id"]
-
-    conversation_id = (
-        request.conversation_id
+    question = (
+        request.question.strip()
+        if request.question
+        else ""
     )
 
-    (
-        conversation_id,
-        conversation
-    ) = conversation_service.get_or_create_conversation(
+    user_id = current_user["id"]
+
+    # ========================================================
+    # VALIDATE QUESTION
+    # ========================================================
+    if not question:
+        return {
+            "question": question,
+            "answer":
+                "Please enter a question.",
+            "sources": [],
+            "conversation_id":
+                request.conversation_id,
+        }
+
+    # ========================================================
+    # GET CURRENT USER DOCUMENTS
+    #
+    # These are ALL documents currently uploaded by the user.
+    # They are stored separately from current_documents,
+    # which represents documents used by the latest answer.
+    # ========================================================
+    all_documents = (
+        document_manager
+        .get_documents()
+    )
+
+    user_documents = [
+        document
+        for document in all_documents
+        if document.get(
+            "user_id"
+        ) == user_id
+    ]
+
+    available_document_names = []
+
+    available_document_ids = []
+
+    for document in user_documents:
+        document_id = document.get(
+            "id"
+        )
+
+        filename = document.get(
+            "filename"
+        )
+
+        if (
+            document_id
+            and document_id
+            not in available_document_ids
+        ):
+            available_document_ids.append(
+                document_id
+            )
+
+        if (
+            filename
+            and filename
+            not in available_document_names
+        ):
+            available_document_names.append(
+                filename
+            )
+
+    logger.info(
+        "Available user documents | "
+        "user=%s | documents=%s",
+        user_id,
+        available_document_names,
+    )
+
+    # ========================================================
+    # GET OR CREATE CONVERSATION
+    # ========================================================
+    conversation = (
+        conversation_service
+        .get_or_create_conversation(
+            user_id=user_id,
+            conversation_id=(
+                request.conversation_id
+            ),
+            document_ids=(
+                available_document_ids
+            ),
+            document_names=(
+                available_document_names
+            ),
+        )
+    )
+
+    conversation_id = conversation[
+        "id"
+    ]
+
+    # ========================================================
+    # ALWAYS REFRESH AVAILABLE DOCUMENTS
+    #
+    # This is important because the user can upload another
+    # PDF after a conversation has already started.
+    #
+    # Example:
+    #
+    # Q1 -> Inbound.pdf uploaded
+    # Upload -> Outbound.pdf
+    # Q2 -> "What about the outbound one?"
+    #
+    # The existing conversation must now know about both.
+    # ========================================================
+    conversation_service.set_available_documents(
         user_id=user_id,
-        conversation_id=conversation_id
+        conversation_id=conversation_id,
+        document_ids=available_document_ids,
+        document_names=available_document_names,
+    )
+
+    logger.info(
+        "Conversation available documents updated | "
+        "conversation=%s | documents=%s",
+        conversation_id,
+        available_document_names,
     )
 
     logger.info(
@@ -476,26 +956,16 @@ async def ask_question(
         "user=%s | conversation=%s",
         question,
         user_id,
-        conversation_id
+        conversation_id,
     )
 
-    if not question:
-        return {
-            "question": question,
-            "answer":
-                "Please enter a question.",
-            "sources": [],
-            "conversation_id": conversation_id,
-        }
-
-    # ============================================================
+    # ========================================================
     # PREVIOUS CONVERSATION CONTEXT
-    # ============================================================
+    # ========================================================
     conversation_context = (
         conversation_service.get_context(
             user_id=user_id,
             conversation_id=conversation_id,
-            message_limit=5,
         )
     )
 
@@ -518,26 +988,110 @@ async def ask_question(
         )
     )
 
+    available_documents = (
+        conversation_context.get(
+            "available_documents",
+            []
+        )
+    )
+
     logger.info(
         "Conversation context | "
         "conversation=%s | "
         "last_question=%s | "
-        "documents=%s",
+        "last_answer=%s | "
+        "current_documents=%s | "
+        "available_documents=%s",
         conversation_id,
         last_question,
+        last_answer,
         current_documents,
+        available_documents,
     )
 
-    # ============================================================
+    # ========================================================
     # DETECT QUESTION TYPE
-    # ============================================================
-
+    # ========================================================
     normalized_question = (
         question.lower()
     )
 
-    signature_keywords = [
+    # ========================================================
+    # FOLLOWUP DETECTION
+    # ========================================================
+    is_follow_up = _detect_follow_up_question(
+        question=question,
+        last_question=last_question,
+        last_answer=last_answer,
+        current_documents=current_documents,
+    )
 
+    # ========================================================
+    # EXPLICIT DOCUMENT REFERENCE
+    # ========================================================
+    explicit_document = _detect_explicit_document(
+        question=question,
+        available_documents=available_documents,
+    )
+
+    logger.info(
+        "Question Context detection | "
+        "conversation=%s | "
+        "is_follow_up=%s | "
+        "explicit_document=%s",
+        conversation_id,
+        is_follow_up,
+        explicit_document,
+    )
+
+    # ========================================================
+    # REWRITE FOLLOW-UP QUESTION
+    # ========================================================
+    rewritten_question = question
+    target_document = explicit_document
+
+    if is_follow_up:
+        rewrite_result = rewrite_followup_question(
+            question=question,
+            last_question=last_question,
+            last_answer=last_answer,
+            current_documents=available_documents,
+            explicit_document=explicit_document,
+        )
+
+        rewritten_question = (
+            rewrite_result.get(
+                "standalone_question",
+                question,
+            )
+            or question
+        )
+
+        target_document = (
+            rewrite_result.get(
+                "target_document"
+            )
+            or explicit_document
+        )
+
+        logger.info(
+            "Follow-up rewrite | "
+            "conversation=%s | "
+            "original=%s | "
+            "rewritten=%s | "
+            "target_document=%s",
+            conversation_id,
+            question,
+            rewritten_question,
+            target_document,
+        )
+    else:
+        logger.info(
+            "Question is standalone | question=%s",
+            question,
+        )
+
+    signature_keywords = [
         "signatory",
         "signatories",
         "signature",
@@ -560,13 +1114,12 @@ async def ask_question(
         in signature_keywords
     )
 
-    # ============================================================
+    # ========================================================
     # RETRIEVE
     #
     # We request more results for signature questions because
     # the actual signature block may be several chunks away.
-    # ============================================================
-
+    # ========================================================
     retrieval_k = (
         8
         if is_signature_question
@@ -574,20 +1127,18 @@ async def ask_question(
     )
 
     results = vector_store.search(
-        query=question,
+        query=rewritten_question,
         top_k=retrieval_k,
-        user_id=current_user["id"],
+        user_id=user_id,
     )
 
-    # ============================================================
+    # ========================================================
     # SIGNATURE RESULTS
     #
     # vector_store already performs signature-aware ranking.
     # We only perform a conservative final ordering here.
-    # ============================================================
-
+    # ========================================================
     if is_signature_question:
-
         signature_results = [
             result
             for result in results
@@ -598,11 +1149,11 @@ async def ask_question(
         ]
 
         if signature_results:
-
             other_results = [
                 result
                 for result in results
-                if result not in signature_results
+                if result
+                not in signature_results
             ]
 
             signature_results.sort(
@@ -631,14 +1182,11 @@ async def ask_question(
                 len(results)
             )
 
-    # ============================================================
+    # ========================================================
     # NO RESULTS
-    # ============================================================
-
+    # ========================================================
     if not results:
-
         return {
-
             "question":
                 question,
 
@@ -647,23 +1195,25 @@ async def ask_question(
 
             "sources":
                 [],
+
+            "conversation_id":
+                conversation_id,
         }
 
-    # ============================================================
+    # ========================================================
     # LOG RETRIEVED RESULTS
-    # ============================================================
+    # ========================================================
 
     logger.info(
         "Retrieved %s relevant chunks for: %s",
         len(results),
-        question
+        rewritten_question
     )
 
     for rank, result in enumerate(
         results,
         start=1
     ):
-
         logger.info(
             "ASK RESULT %s | FILE=%s | PAGE=%s | "
             "CHUNK=%s | FINAL=%.4f | "
@@ -697,14 +1247,12 @@ async def ask_question(
             ),
         )
 
-    # ============================================================
+    # ========================================================
     # BUILD GEMINI CONTEXT
-    # ============================================================
-
+    # ========================================================
     context_parts = []
 
     for result in results:
-
         context_parts.append(
             f"""
 DOCUMENT:
@@ -741,24 +1289,26 @@ CONTENT:
         .join(context_parts)
     )
 
-    # ============================================================
+    # ========================================================
     # GEMINI
-    # ============================================================
-
+    # ========================================================
     answer = ask_gemini(
         context,
-        question
+        rewritten_question
     )
 
-    # ============================================================
+    # ========================================================
     # STORE CONVERSATION MESSAGE
-    # ============================================================
+    #
+    # For now the question is stored unchanged.
+    # Actual follow-up rewriting comes in the next step.
+    # ========================================================
     conversation_service.add_message(
         user_id=user_id,
         conversation_id=conversation_id,
         question=question,
         answer=answer,
-        rewritten_question=question,
+        rewritten_question=rewritten_question,
         sources=results,
     )
 
@@ -769,14 +1319,12 @@ CONTENT:
         question,
     )
 
-    # ============================================================
+    # ========================================================
     # SOURCES
-    # ============================================================
-
+    # ========================================================
     sources = []
 
     for result in results:
-
         sources.append(
             {
                 "document_id":
@@ -843,10 +1391,9 @@ CONTENT:
             }
         )
 
-    # ============================================================
+    # ========================================================
     # RESPONSE
-    # ============================================================
-
+    # ========================================================
     return {
         "question":
             question,
