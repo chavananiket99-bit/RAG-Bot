@@ -2416,6 +2416,7 @@ class FAISSVectorStore:
         query,
         top_k=5,
         user_id=None,
+        resolved_filename=None,
     ):
 
         if not query or not query.strip():
@@ -2434,12 +2435,19 @@ class FAISSVectorStore:
             query
         )
 
-        target_documents = (
-            self._detect_target_documents(
-                query,
-                user_id=user_id
+        target_documents = set()
+
+        if resolved_filename:
+            target_documents = {
+                resolved_filename
+            }
+        else:
+            target_documents = (
+                self._detect_target_documents(
+                    query,
+                    user_id=user_id
+                )
             )
-        )
 
         has_explicit_document = bool(
             target_documents
@@ -2939,6 +2947,62 @@ class FAISSVectorStore:
                 result["financial_score"],
             )
 
+            logger.info(
+                "========== RAG RETRIEVAL DEBUG =========="
+            )
+
+            logger.info(
+                "QUERY=%s",
+                query
+            )
+
+            logger.info(
+                "INTENT=%s",
+                intent
+            )
+
+            logger.info(
+                "TARGET_DOCUMENTS=%s",
+                list(target_documents)
+            )
+
+            for rank, result in enumerate(
+                final_results,
+                start=1,
+            ):
+                logger.info(
+                    "RESULT %s | "
+                    "FILE=%s | "
+                    "PAGE=%s | "
+                    "CHUNK=%s | "
+                    "FINAL=%.4f | "
+                    "SEMANTIC=%.4f | "
+                    "LEXICAL=%.4f | "
+                    "RELEVANCE=%.4f | "
+                    "SIGNATURE=%.4f | "
+                    "FINANCIAL=%.4f",
+                    rank,
+                    result.get("filename"),
+                    result.get("page_number"),
+                    result.get("chunk_index"),
+                    result.get("final_score", 0.0),
+                    result.get("semantic_score", 0.0),
+                    result.get("lexical_score", 0.0),
+                    result.get("relevance_score", 0.0),
+                    result.get("signature_score", 0.0),
+                    result.get("financial_score", 0.0),
+                )
+
+                logger.info(
+                    "RESULT %s TEXT=%s",
+                    rank,
+                    result.get("text", "")[:1000],
+                )
+
+            logger.info(
+                "========== END RAG RETRIEVAL DEBUG =========="
+            )
+
         return final_results
 
     # ========================================================
@@ -3229,6 +3293,509 @@ class FAISSVectorStore:
                 "document_vector_counts":
                     document_counts,
             }
+
+    def search_in_document(
+        self,
+        query,
+        filename,
+        top_k=5,
+        user_id=None,
+        resolved_filename=None,
+    ):
+        """
+        Search only within the specified document.
+        This is intentionally separate from the normal hybrid search.
+        It prevents semantically similar chunks from other documents
+        from entering the answer context.
+        """
+        if not query or not query.strip():
+            return []
+
+        if not filename:
+            return []
+
+        # --------------------------------------------------------
+        # Find vector IDs belonging to the requested document
+        # --------------------------------------------------------
+        allowed_vector_ids = []
+
+        for vector_id, metadata in self.metadata.items():
+            if user_id is not None:
+                if metadata.get("user_id") != user_id:
+                    continue
+
+            if metadata.get("filename") != filename:
+                continue
+
+            try:
+                allowed_vector_ids.append(int(vector_id))
+            except (TypeError, ValueError):
+                continue
+
+        if not allowed_vector_ids:
+            logger.warning(
+                "No vectors found for document | "
+                "filename=%s | user=%s",
+                filename,
+                user_id,
+            )
+            return []
+
+        # --------------------------------------------------------
+        # Embed query
+        # --------------------------------------------------------
+        query_embedding = embedding_service.embed_text(query)
+
+        if query_embedding is None:
+            return []
+
+        query_vector = np.asarray(
+            [query_embedding],
+            dtype="float32",
+        )
+
+        if query_vector.ndim != 2:
+            raise ValueError(
+                "Query embedding must be a 2D vector."
+            )
+
+        if query_vector.shape[1] != self.dimension:
+            raise ValueError(
+                "Embedding dimension mismatch."
+            )
+
+        # --------------------------------------------------------
+        # Search the FAISS index
+        #
+        # We search all vectors because IndexIDMap2 does not provide
+        # a simple metadata filter.
+        # --------------------------------------------------------
+        search_k = min(
+            self.index.ntotal,
+            max(
+                len(allowed_vector_ids),
+                top_k * 10,
+                20,
+            ),
+        )
+
+        scores, vector_ids = self.index.search(
+            query_vector,
+            search_k,
+        )
+
+        allowed_ids = set(
+            allowed_vector_ids
+        )
+
+        results = []
+
+        for score, vector_id in zip(
+            scores[0],
+            vector_ids[0],
+        ):
+            if vector_id == -1:
+                continue
+
+            vector_id = int(vector_id)
+
+            if vector_id not in allowed_ids:
+                continue
+
+            metadata = self.metadata.get(
+                str(vector_id)
+            )
+
+            if not metadata:
+                continue
+
+            results.append(
+                {
+                    "score": float(score),
+                    "semantic_score": float(score),
+                    "lexical_score": 0.0,
+                    "vector_id": vector_id,
+                    "document_id": metadata.get(
+                        "document_id"
+                    ),
+                    "filename": metadata.get(
+                        "filename",
+                        "",
+                    ),
+                    "chunk_index": metadata.get(
+                        "chunk_index",
+                        0,
+                    ),
+                    "page_number": metadata.get(
+                        "page_number"
+                    ),
+                    "text": metadata.get(
+                        "text",
+                        "",
+                    ),
+                }
+            )
+
+            if len(results) >= top_k:
+                break
+
+        # --------------------------------------------------------
+        # Add lexical score as a secondary signal
+        # --------------------------------------------------------
+        lexical_results = self._lexical_search(
+            query,
+            top_k=max(top_k * 5, 20),
+            user_id=user_id,
+        )
+
+        lexical_by_id = {
+            item["vector_id"]: item
+            for item in lexical_results
+            if item.get("filename") == filename
+        }
+
+        for result in results:
+            lexical = lexical_by_id.get(
+                result["vector_id"]
+            )
+
+            if lexical:
+                result["lexical_score"] = float(
+                    lexical.get(
+                        "score",
+                        0.0
+                    )
+                )
+
+        # --------------------------------------------------------
+        # Re-rank inside the selected document
+        # --------------------------------------------------------
+        for result in results:
+            relevance_score = (
+                self._query_relevance_score(
+                    query,
+                    result["text"],
+                )
+            )
+
+            intent_score = (
+                self._intent_score(
+                    query,
+                    result["text"],
+                )
+            )
+
+            signature_score = (
+                self._signature_score(
+                    query,
+                    result["text"],
+                )
+            )
+
+            financial_score = (
+                self._financial_score(
+                    query,
+                    result["text"],
+                )
+            )
+
+            result["relevance_score"] = float(
+                relevance_score
+            )
+
+            result["intent_score"] = float(
+                intent_score
+            )
+
+            result["signature_score"] = float(
+                signature_score
+            )
+
+            result["financial_score"] = float(
+                financial_score
+            )
+
+            result["final_score"] = float(
+                result["semantic_score"] * 0.45
+                + result["relevance_score"] * 0.25
+                + result["intent_score"] * 0.10
+                + result["signature_score"] * 0.10
+                + result["financial_score"] * 0.10
+            )
+
+        results.sort(
+            key=lambda item: item.get(
+                "final_score",
+                0.0
+            ),
+            reverse=True,
+        )
+        return results[:top_k]
+
+    def resolve_document(
+        self,
+        query,
+        user_id=None,
+    ):
+        """
+        Resolve the most likely uploaded document from the query.
+        Returns:
+            {
+                "filename": "...",
+                "score": float,
+                "ambiguous": bool,
+                "candidates": [...]
+            }
+        Returns filename=None when there is no sufficiently strong
+        document match.
+        """
+        if not query or not query.strip():
+            return {
+                "filename": None,
+                "score": 0.0,
+                "ambiguous": False,
+                "candidates": [],
+            }
+
+        query_text = self._normalize_text(
+            query
+        )
+
+        aliases = {
+            "wh": "warehouse",
+            "whs": "warehouse",
+            "warehouses": "warehouse",
+            "off": "office",
+            "offs": "office",
+            "offices": "office",
+        }
+
+        query_tokens = {
+            aliases.get(
+                token,
+                token,
+            )
+            for token in query_text.split()
+        }
+
+        generic_terms = {
+            "what",
+            "is",
+            "are",
+            "was",
+            "were",
+            "the",
+            "a",
+            "an",
+            "of",
+            "for",
+            "to",
+            "in",
+            "on",
+            "at",
+            "and",
+            "or",
+            "with",
+            "from",
+            "by",
+            "how",
+            "much",
+            "please",
+            "tell",
+            "me",
+            "give",
+            "about",
+            "agreement",
+            "agreements",
+            "document",
+            "documents",
+            "file",
+            "files",
+            "pdf",
+            "contract",
+            "contracts",
+        }
+
+        query_tokens -= generic_terms
+
+        if not query_tokens:
+            return {
+                "filename": None,
+                "score": 0.0,
+                "ambiguous": False,
+                "candidates": [],
+            }
+
+        # --------------------------------------------------------
+        # Build unique documents
+        # --------------------------------------------------------
+        documents = {}
+
+        for metadata in self.metadata.values():
+            if user_id is not None:
+                if metadata.get("user_id") != user_id:
+                    continue
+
+            filename = metadata.get(
+                "filename",
+                "",
+            )
+
+            if filename:
+                documents[filename] = True
+
+        candidates = []
+
+        for filename in documents:
+            filename_text = self._normalize_text(
+                Path(filename).stem
+            )
+
+            filename_tokens = {
+                aliases.get(
+                    token,
+                    token,
+                )
+                for token in filename_text.split()
+            }
+
+            filename_tokens -= generic_terms
+            
+            if not filename_tokens:
+                continue
+
+            overlap = (
+                query_tokens
+                & filename_tokens
+            )
+
+            if not overlap:
+                continue
+
+            # ----------------------------------------------------
+            # Distinctive filename tokens are more important
+            # than generic tokens such as warehouse / office.
+            # ----------------------------------------------------
+            distinctive = {
+                token
+                for token in filename_tokens
+                if token not in {
+                    "warehouse",
+                    "office",
+                    "space",
+                    "lp",
+                    "wh",
+                }
+                and not token.isdigit()
+            }
+
+            distinctive_overlap = (
+                overlap
+                & distinctive
+            )
+
+            query_coverage = (
+                len(overlap)
+                / len(query_tokens)
+            )
+
+            filename_coverage = (
+                len(overlap)
+                / len(filename_tokens)
+            )
+
+            score = (
+                query_coverage * 5.0
+                + filename_coverage * 3.0
+                + len(distinctive_overlap) * 5.0
+            )
+
+            candidates.append(
+                {
+                    "filename": filename,
+                    "score": score,
+                    "overlap": sorted(overlap),
+                    "distinctive_overlap":
+                        sorted(
+                            distinctive_overlap
+                        ),
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: item["score"],
+            reverse=True,
+        )
+
+        if not candidates:
+            return {
+                "filename": None,
+                "score": 0.0,
+                "ambiguous": False,
+                "candidates": [],
+            }
+
+        best = candidates[0]
+
+        # --------------------------------------------------------
+        # Ambiguity detection
+        # --------------------------------------------------------
+        ambiguous = False
+
+        if len(candidates) > 1:
+            second = candidates[1]
+
+            if second["score"] >= (
+                best["score"] * 0.90
+            ):
+                ambiguous = True
+
+        # --------------------------------------------------------
+        # Do not force a weak document match
+        # --------------------------------------------------------
+        if best["score"] < 3.0:
+            return {
+                "filename": None,
+                "score": float(
+                    best["score"]
+                ),
+                "ambiguous": False,
+                "candidates": candidates[:5],
+            }
+
+        if ambiguous:
+            logger.warning(
+                "Ambiguous document resolution | "
+                "query=%s | candidates=%s",
+                query,
+                candidates[:5],
+            )
+
+            return {
+                "filename": None,
+                "score": float(
+                    best["score"]
+                ),
+                "ambiguous": True,
+                "candidates": candidates[:5],
+            }
+
+        logger.info(
+            "Document resolved | "
+            "query=%s | filename=%s | score=%.4f",
+            query,
+            best["filename"],
+            best["score"],
+        )
+
+        return {
+            "filename": best["filename"],
+            "score": float(
+                best["score"]
+            ),
+            "ambiguous": False,
+            "candidates": candidates[:5],
+        }
 
 
 # ============================================================
