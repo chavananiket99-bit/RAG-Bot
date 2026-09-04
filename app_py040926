@@ -1116,27 +1116,26 @@ async def ask_question(
             question,
         )
 
-    # ============================================================
-    # DOCUMENT RESOLUTION
-    # ============================================================
-    document_resolution = (
-        vector_store.resolve_document(
+    # ========================================================
+    # FINAL DOCUMENT RESOLUTION
+    # ========================================================
+    
+    resolved_filename = target_document
+
+    if not resolved_filename:
+        document_resolution = vector_store.resolve_document(
             rewritten_question,
             user_id=user_id,
         )
-    )
-    
-    resolved_filename = (
-        document_resolution.get("filename")
-    )
 
-    if target_document:
-        resolved_filename = target_document
+        resolved_filename = (
+            document_resolution.get("filename")
+        )
 
     logger.info(
-        "Document resolution | "
+        "Final document resolution | "
         "conversation=%s | "
-        "question=%s | "
+        "original_question=%s | "
         "rewritten_question=%s | "
         "target_document=%s | "
         "resolved_filename=%s",
@@ -1186,12 +1185,51 @@ async def ask_question(
         else 5
     )
 
-    results = vector_store.search(
-        query=rewritten_question,
-        top_k=retrieval_k,
-        user_id=user_id,
-        resolved_filename=resolved_filename,
+    # ========================================================
+    # RETRIEVE
+    # ========================================================
+    retrieval_k = (
+        8
+        if is_signature_question
+        else 5
     )
+
+    # --------------------------------------------------------
+    # CRITICAL DOCUMENT ISOLATION
+    #
+    # If a document has been explicitly identified, NEVER use
+    # normal cross-document hybrid search.
+    #
+    # Search only inside the selected document.
+    # This prevents a semantically similar chunk from another
+    # PDF from entering the Gemini context.
+    # --------------------------------------------------------
+    if resolved_filename:
+        logger.info(
+            "Document-restricted retrieval | "
+            "document=%s | query=%s",
+            resolved_filename,
+            rewritten_question,
+        )
+
+        results = vector_store.search_in_document(
+            query=rewritten_question,
+            filename=resolved_filename,
+            top_k=retrieval_k,
+            user_id=user_id,
+        )
+    else:
+        logger.info(
+            "Cross-document retrieval | query=%s",
+            rewritten_question,
+        )
+
+        results = vector_store.search(
+            query=rewritten_question,
+            top_k=retrieval_k,
+            user_id=user_id,
+            resolved_filename=None,
+        )
 
     # ========================================================
     # SIGNATURE RESULTS
