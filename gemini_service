@@ -1,0 +1,510 @@
+//gemini_service.py
+import google.generativeai as genai
+import os
+import json
+import re
+import logging
+
+from dotenv import load_dotenv
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-3.5-flash")
+
+def ask_gemini(context, question):
+   normalized_question = question.lower()
+   signature_keywords = [
+       "signatory",
+       "signatories",
+       "signature",
+       "signatures",
+       "signed",
+       "signed by",
+       "who signed",
+       "authorized signatory",
+       "authorised signatory",
+       "esign",
+       "e sign",
+   ]
+   is_signature_question = any(
+       keyword in normalized_question
+       for keyword in signature_keywords
+   )
+   if is_signature_question:
+       prompt = f"""
+You are an enterprise document question-answering assistant.
+You must answer the user's question using ONLY the supplied
+document context.
+The user is asking specifically about a SIGNATORY / SIGNATURE.
+STRICT SIGNATORY RULES:
+1. Identify a person's name as a signatory ONLY when the
+  retrieved document context explicitly connects that person
+  to a signature, signed section, authorized signatory section,
+  electronic signature, "signed by" section, or equivalent.
+2. Do NOT assume that a person's name is a signatory merely
+  because the name appears somewhere in the document.
+3. Do NOT infer or guess which company a person represents.
+4. A person's company/organization must be stated explicitly
+  in the same relevant document context.
+5. Do NOT combine a person's name from one chunk with a company
+  name from another unrelated chunk unless the context clearly
+  establishes that relationship.
+6. If the document identifies the person but does not explicitly
+  identify the company they represent, report the person's name
+  and say that the company association is not specified.
+7. Preserve names exactly as they appear in the document.
+  Do not correct spelling based on outside knowledge.
+8. If multiple people are explicitly identified as signatories,
+  list each person separately.
+9. If the document contains different amendments or agreements,
+  do not mix signatories from different agreements unless the
+  context explicitly connects them to the agreement in the
+  user's question.
+10. If the retrieved context does not contain enough evidence
+   to identify the signatory, reply exactly:
+"I couldn't find that information in the uploaded document."
+11. Do not use outside knowledge.
+12. Do not mention FAISS, embeddings, retrieval, chunks,
+   vector search, RRF, BM25, or internal implementation.
+RESPONSE FORMAT FOR SIGNATORY QUESTIONS:
+If explicitly supported:
+"The document identifies the following signatory/signatories:
+- Name: <exact name>
+ Company/Organization: <company only if explicitly stated>
+ Designation: <designation only if explicitly stated>"
+If the company or designation is not explicitly stated,
+omit it or say:
+"Company/Organization: Not specified in the document."
+DOCUMENT CONTEXT:
+{context}
+USER QUESTION:
+{question}
+ANSWER:
+"""
+   else:
+       prompt = f"""
+You are an enterprise document question-answering assistant.
+Your task is to answer the user's question using ONLY the
+information contained in the provided document context.
+IMPORTANT RULES:
+1. Do not use outside knowledge.
+2. Do not guess or infer facts that are not supported by
+  the document context.
+3. If multiple documents are provided, use only the documents
+  that contain information relevant to the question.
+4. Ignore irrelevant document chunks.
+5. If the context does not contain enough information to answer
+  the question, reply exactly:
+"I couldn't find that information in the uploaded document."
+6. When the answer contains a number, amount, date, name,
+  percentage, duration, or other specific value, preserve the
+  value exactly as supported by the document.
+7. Give a concise and direct answer.
+8. Do not combine unrelated pieces of information merely because
+  they appear in different document chunks.
+9. Do not infer relationships between people, companies,
+  agreements, dates, amounts, or clauses unless the document
+  explicitly establishes that relationship.
+10. Do not mention retrieval, embeddings, FAISS, BM25, RRF,
+   chunks, or internal implementation details.
+DOCUMENT CONTEXT:
+{context}
+USER QUESTION:
+{question}a
+"""
+   response = model.generate_content(
+       prompt
+   )
+   return response.text
+
+# ============================================================
+# FOLLOW-UP QUESTION REWRITER
+# ============================================================
+def rewrite_followup_question(
+  question,
+  last_question=None,
+  last_answer=None,
+  current_documents=None,
+  explicit_document=None,
+):
+  """
+  Rewrite a conversational follow-up question into a
+  standalone retrieval question.
+  The function does NOT answer the question.
+  Example:
+    Previous:
+    "What is the rent of the Inbound warehouse?"
+    Current:
+    "What about the outbound one?"
+    Result:
+    "What is the rent of the Outbound warehouse?"
+  The original question is returned unchanged when there is
+  not enough conversation context to safely rewrite it.
+  """
+
+  # ========================================================
+  # SAFETY / EMPTY INPUT
+  # ========================================================
+  if not question or not question.strip():
+    return {
+      "is_follow_up": False,
+      "standalone_question": question or "",
+      "target_document": explicit_document,
+    }
+
+  current_question = question.strip()
+
+  previous_question = (
+    last_question.strip()
+    if isinstance(
+      last_question,
+      str
+    )
+    else ""
+  )
+
+  previous_answer = (
+    last_answer.strip()
+    if isinstance(
+      last_answer,
+      str
+    )
+    else ""
+  )
+
+  documents = (
+    current_documents
+    if isinstance(
+      current_documents,
+      list
+    )
+    else []
+  )
+
+  # ========================================================
+  # NO PREVIOUS CONTEXT
+  #
+  # Without previous context, do not ask Gemini to invent
+  # a relationship.
+  # ========================================================
+  if (
+    not previous_question
+    and not previous_answer
+  ):
+    return {
+      "is_follow_up": False,
+      "standalone_question": current_question,
+      "target_document": explicit_document,
+    }
+
+  # ========================================================
+  # LIMIT CONTEXT SIZE
+  #
+  # Previous answers can sometimes be large. We only need
+  # enough context to resolve references such as:
+  #
+  # "it"
+  # "that one"
+  # "outbound one"
+  # "the rate"
+  # ========================================================
+  previous_answer_context = (
+    previous_answer[:4000]
+    if previous_answer
+    else ""
+  )
+
+  # ========================================================
+  # DOCUMENT LIST
+  # ========================================================
+  document_list = "\n".join(
+    f"- {filename}"
+    for filename in documents
+    if filename
+  )
+
+  if not document_list:
+    document_list = "- No document list available"
+
+  resolved_document = (
+    explicit_document
+    if explicit_document
+    else "None"
+  )
+
+  # ========================================================
+  # STRICT REWRITING PROMPT
+  # ========================================================
+  prompt = f"""
+You are a query-rewriting component inside an enterprise
+document RAG system.
+
+Your job is ONLY to determine whether the current question
+depends on the previous conversation and, if necessary,
+rewrite it into a standalone retrieval question.
+
+DO NOT answer the question.
+
+DO NOT summarize the documents.
+
+DO NOT invent facts.
+
+DO NOT add information that is not supported by the
+conversation.
+
+============================================================
+PREVIOUS USER QUESTION
+============================================================
+{previous_question}
+
+============================================================
+PREVIOUS ANSWER
+============================================================
+{previous_answer_context}
+
+============================================================
+CURRENT USER QUESTION
+============================================================
+{current_question}
+
+============================================================
+AVAILABLE UPLOADED DOCUMENTS
+============================================================
+{document_list}
+
+============================================================
+DETERMINISTICALLY RESOLVED DOCUMENT
+============================================================
+{resolved_document}
+
+============================================================
+RULES
+============================================================
+1. If the current question is already standalone, keep it
+  essentially unchanged.
+2. If the current question is a follow-up, resolve references
+  such as:
+  - it
+  - its
+  - this
+  - that
+  - this one
+  - that one
+  - the other one
+  - the second one
+  - outbound one
+  - inbound one
+  - the same
+  - and the rate
+  - what about renewal
+  using the previous question and conversation context.
+3. If a document has been deterministically resolved,
+  prefer that document when resolving the follow-up.
+4. Preserve the user's requested subject.
+  Example:
+  Previous question:
+  "What is the rent of the Inbound warehouse?"
+  Current question:
+  "What about the outbound one?"
+  Rewrite as a question about the rent of the Outbound
+  warehouse.
+5. If the current question is:
+  "And the rate?"
+  and the previous question was about the rent of the
+  Inbound warehouse, preserve the previous subject and
+  document unless another document is explicitly referenced.
+6. Do not invent a document name.
+7. Do not invent a business term, amount, date, person,
+  location, or other factual detail.
+8. If the relationship cannot be safely determined, return
+  the current question unchanged and set is_follow_up to
+  false.
+9. Return ONLY valid JSON.
+10. Use exactly this JSON structure:
+{{
+   "is_follow_up": true,
+   "standalone_question": "rewritten question",
+   "target_document": "document filename or null"
+}}
+============================================================
+"""
+  # ========================================================
+  # CALL GEMINI
+  # ========================================================
+  try:
+    response = model.generate_content(
+      prompt
+    )
+
+    response_text = (
+      getattr(
+        response,
+        "text",
+        ""
+      )
+      or ""
+    ).strip()
+
+    if not response_text:
+      logger.warning(
+        "Follow-up rewriter returned empty response."
+      )
+
+      return {
+        "is_follow_up": False,
+        "standalone_question":
+          current_question,
+        "target_document":
+          explicit_document,
+      }
+
+    # ====================================================
+    # REMOVE MARKDOWN JSON FENCE IF GEMINI ADDS ONE
+    # ====================================================
+    response_text = re.sub(
+      r"^```(?:json)?\s*",
+      "",
+      response_text,
+      flags=re.IGNORECASE,
+    )
+
+    response_text = re.sub(
+      r"\s*```$",
+      "",
+      response_text,
+    ).strip()
+
+    # ====================================================
+    # PARSE JSON
+    # ====================================================
+    parsed = json.loads(
+      response_text
+    )
+
+    is_follow_up = bool(
+      parsed.get(
+        "is_follow_up",
+        False
+      )
+    )
+
+    standalone_question = (
+      parsed.get(
+        "standalone_question"
+      )
+    )
+
+    target_document = (
+      parsed.get(
+        "target_document"
+      )
+    )
+
+    # ====================================================
+    # VALIDATE REWRITTEN QUESTION
+    # ====================================================
+    if not isinstance(
+      standalone_question,
+      str
+    ):
+      standalone_question = (
+        current_question
+      )
+
+    standalone_question = (
+      standalone_question.strip()
+    )
+
+    if not standalone_question:
+      standalone_question = (
+        current_question
+      )
+
+    # ====================================================
+    # VALIDATE TARGET DOCUMENT
+    #
+    # Gemini must not invent a filename.
+    # ====================================================
+    if target_document:
+      target_document = (
+        str(
+          target_document
+        ).strip()
+      )
+
+      if (
+        target_document
+        not in documents
+      ):
+        logger.warning(
+          "Follow-up rewriter returned "
+          "unknown document: %s",
+          target_document,
+        )
+
+        target_document = (
+          explicit_document
+        )
+    else:
+      target_document = (
+        explicit_document
+      )
+
+    # ====================================================
+    # LOG RESULT
+    # ====================================================
+    logger.info(
+      "Follow-up rewrite completed | "
+      "original=%s | follow_up=%s | "
+      "rewritten=%s | target_document=%s",
+      current_question,
+      is_follow_up,
+      standalone_question,
+      target_document,
+    )
+
+    return {
+      "is_follow_up":
+        is_follow_up,
+      "standalone_question":
+        standalone_question,
+      "target_document":
+        target_document,
+    }
+
+  except json.JSONDecodeError as exc:
+    logger.warning(
+      "Follow-up rewriter returned invalid JSON: %s",
+      exc,
+    )
+
+    return {
+      "is_follow_up": False,
+      "standalone_question":
+        current_question,
+      "target_document":
+        explicit_document,
+    }
+
+  except Exception as exc:
+    logger.exception(
+      "Follow-up question rewriting failed: %s",
+      exc,
+    )
+
+    # ----------------------------------------------------
+    # Fail safely.
+    #
+    # If rewriting fails, use the original question.
+    # This means the new functionality cannot break the
+    # existing RAG pipeline.
+    # ----------------------------------------------------
+    return {
+      "is_follow_up": False,
+      "standalone_question":
+        current_question,
+      "target_document":
+        explicit_document,
+    }
