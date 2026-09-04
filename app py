@@ -1010,13 +1010,6 @@ async def ask_question(
     )
 
     # ========================================================
-    # DETECT QUESTION TYPE
-    # ========================================================
-    normalized_question = (
-        rewritten_question.lower()
-    )
-
-    # ========================================================
     # FOLLOWUP DETECTION
     # ========================================================
     is_follow_up = _detect_follow_up_question(
@@ -1095,7 +1088,7 @@ async def ask_question(
     # DOCUMENT RESOLUTION
     # ============================================================
     document_resolution = (
-        document_manager.resolve_document(
+        vector_store.resolve_document(
             rewritten_question,
             user_id=user_id,
         )
