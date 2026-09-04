@@ -1,0 +1,38 @@
+//document_store.py
+documents = {}
+
+def save_document(document_id, filename, chunks):
+    """
+    Store chunks using the unique document ID.
+
+    This allows multiple documents to have the same filename without overwriting each other.
+    """
+
+    documents[document_id] = {
+        "filename": filename,
+        "chunks": chunks
+    }
+
+def get_document(document_id):
+    return documents.get(document_id)
+
+def get_all_documents():
+    return documents
+
+def get_all_chunks():
+    chunks = []
+
+    for document in documents.values():
+        chunks.extend(document["chunks"])
+
+    return chunks
+
+def delete_document(document_id):
+    """
+    Remove a document from the in-memory RAG store.
+    """
+
+    if document_id in documents:
+        del documents[document_id]
+        return True
+    return False
