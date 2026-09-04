@@ -1013,7 +1013,7 @@ async def ask_question(
     # DETECT QUESTION TYPE
     # ========================================================
     normalized_question = (
-        question.lower()
+        rewritten_question.lower()
     )
 
     # ========================================================
@@ -1091,6 +1091,41 @@ async def ask_question(
             question,
         )
 
+    # ============================================================
+    # DOCUMENT RESOLUTION
+    # ============================================================
+    document_resolution = (
+        document_manager.resolve_document(
+            rewritten_question,
+            user_id=user_id,
+        )
+    )
+    
+    resolved_filename = (
+        document_resolution.get("filename")
+    )
+
+    if target_document:
+        resolved_filename = target_document
+
+    logger.info(
+        "Document resolution | "
+        "conversation=%s | "
+        "question=%s | "
+        "rewritten_question=%s | "
+        "target_document=%s | "
+        "resolved_filename=%s",
+        conversation_id,
+        question,
+        rewritten_question,
+        target_document,
+        resolved_filename,
+    )
+
+    normalized_question = (
+        rewritten_question.lower()
+    )
+
     signature_keywords = [
         "signatory",
         "signatories",
@@ -1130,6 +1165,7 @@ async def ask_question(
         query=rewritten_question,
         top_k=retrieval_k,
         user_id=user_id,
+        resolved_filename=resolved_filename,
     )
 
     # ========================================================
