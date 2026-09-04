@@ -2791,3 +2791,227 @@ class FAISSVectorStore:
 # ============================================================
 
 vector_store = FAISSVectorStore()
+
+//pdf_service.py
+import logging
+
+from services.pdf_reader import read_pdf
+from services.ocr_reader import read_scanned_pdf
+from services.chunk_service import split_text
+
+logger = logging.getLogger("uvicorn.error")
+
+def extract_text(pdf_path):
+    """
+    Extract text from a PDF.
+    
+    Processing flow:
+        Text PDF
+            ↓
+        Page extraction
+            ↓
+        If no usable text
+            ↓
+        OCR fallback
+            ↓
+        Page-aware chunks
+    
+    Returns:
+        {
+            "text": str,
+            "pages": list[dict],
+            "chunks": list[dict],
+            "ocr_used": bool
+        }
+    """
+
+    logger.info(
+        "Extracting text from PDF: %s",
+        pdf_path
+    )
+
+    # ============================================================
+    # STEP 1 — NORMAL TEXT EXTRACTION
+    # ============================================================
+    pages = read_pdf(
+        pdf_path
+    )
+
+    extracted_text = "\n".join(
+        page.get("text", "")
+        for page in pages
+        if page.get("text")
+    ).strip()
+
+    # ============================================================
+    # STEP 2 — OCR FALLBACK
+    # ============================================================
+    ocr_used = False
+
+    if not extracted_text:
+        logger.info(
+            "No extractable text found. Performing OCR..."
+        )
+        pages = read_scanned_pdf(
+            pdf_path
+        )
+        ocr_used = True
+
+    # ============================================================
+    # STEP 3 — BUILD FULL TEXT
+    # ============================================================
+    text = "\n".join(
+        page.get("text", "")
+        for page in pages
+        if page.get("text")
+    ).strip()
+
+    # ============================================================
+    # STEP 4 — CHUNKING
+    # ============================================================
+    chunks = split_text(
+        pages
+    )
+
+    logger.info(
+        "PDF processing completed. "
+        "Pages=%s | Characters=%s | Chunks=%s | OCR=%s",
+        len(pages),
+        len(text),
+        len(chunks),
+        ocr_used,
+    )
+
+    return {
+        "text": text,
+        "pages": pages,
+        "chunks": chunks,
+        "ocr_used": ocr_used,
+    }
+
+//document_manager.py
+import json
+import uuid
+from pathlib import Path
+from datetime import datetime
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+METADATA_DIR = BASE_DIR / "metadata"
+METADATA_FILE = METADATA_DIR / "documents.json"
+
+class DocumentManager:
+    def __init__(self):
+        METADATA_DIR.mkdir(exist_ok=True)
+
+        if not METADATA_FILE.exists():
+            METADATA_FILE.write_text("[]", encoding='utf-8')
+
+    def get_documents(self):
+        with open(METADATA_FILE, 'r', encoding='utf-8') as file:
+            return json.load(file)
+
+    def save_documents(self, documents):
+        with open(METADATA_FILE, "w", encoding='utf-8') as file:
+            json.dump(documents, file, indent=4, ensure_ascii=False,)
+
+    def add_document(self, filename, filesize, stored_filename=None, user_id=None):
+        documents = self.get_documents()
+
+        document = {
+            "id": str(uuid.uuid4()),
+            "filename": filename,
+            "stored_filename": stored_filename or filename,
+            "filesize": filesize,
+            "uploaded_at": datetime.now().isoformat(),
+            "status": "Indexed",
+            "user_id": user_id
+        }
+
+        documents.append(document)
+        self.save_documents(documents)
+        
+        return document
+
+    def delete_document(self, document_id):
+        documents = self.get_documents()
+        document_to_delete = None
+
+        for document in documents:
+            if document.get("id") == document_id:
+                document_to_delete = document
+                break
+
+        if document_to_delete is None:
+            return None
+
+        documents = [
+            document for document in documents if document.get("id") != document_id
+        ]
+
+        self.save_documents(documents)
+        return document_to_delete
+
+document_manager = DocumentManager()
+
+//auth_dependency.py
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from services.security import decode_access_token
+
+security = HTTPBearer(
+    auto_error=False
+)
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(
+        security
+    ),
+):
+    """
+    Validate the JWT bearer token and return
+    the authenticated user information.
+    """
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+    
+    token = credentials.credentials
+    payload = decode_access_token(
+        token
+    )
+
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token.",
+        )
+    
+    user_id = payload.get(
+        "sub"
+    )
+
+    username = payload.get(
+        "username"
+    )
+
+    if not user_id or not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token.",
+        )
+
+    return {
+        "id": user_id,
+        "username": username,
+        "name": payload.get(
+            "name",
+            username
+        ),
+        "loginType": payload.get(
+            "loginType",
+            "form"
+        ),
+    }
