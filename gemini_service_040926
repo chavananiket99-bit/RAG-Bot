@@ -1,4 +1,4 @@
-//gemini_service.py
+//gemini_service_py040926
 from urllib import response
 
 import google.generativeai as genai
@@ -190,6 +190,7 @@ def rewrite_followup_question(
   last_answer=None,
   current_documents=None,
   explicit_document=None,
+  current_document=None,
 ):
   """
   Rewrite a conversational follow-up question into a
@@ -296,6 +297,12 @@ def rewrite_followup_question(
     else "None"
   )
 
+  active_document = (
+    current_document
+    if current_document
+    else None
+  )
+
   # ========================================================
   # STRICT REWRITING PROMPT
   # ========================================================
@@ -342,6 +349,12 @@ DETERMINISTICALLY RESOLVED DOCUMENT
 {resolved_document}
 
 ============================================================
+CURRENT ACTIVE DOCUMENT
+============================================================
+{active_document}
+============================================================
+ 
+============================================================
 RULES
 ============================================================
 1. If the current question is already standalone, keep it
@@ -362,9 +375,28 @@ RULES
   - and the rate
   - what about renewal
   using the previous question and conversation context.
-3. If a document has been deterministically resolved,
-  prefer that document when resolving the follow-up.
-4. Preserve the user's requested subject.
+3. DOCUMENT PRIORITY:
+  If a document has been deterministically resolved from the
+  CURRENT USER QUESTION, that document is authoritative.
+  NEVER replace an explicitly resolved document with the
+  previous/current document.
+  Example:
+  Current question:
+  "What about AD Outbound?"
+  Deterministically resolved document:
+  "AD Outbound.pdf"
+  Even if the previous active document is:
+  "AD Inbound.pdf"
+  the target document MUST be:
+  "AD Outbound.pdf".
+4. If there is no explicit document in the current question,
+  use CURRENT ACTIVE DOCUMENT when resolving pronouns such as:
+  "it", "this", "that", "the document", "the agreement",
+  "its", or "who signed it".
+5. Only use another document when the current question explicitly
+  refers to another document or the conversation clearly establishes
+  that another document is intended.
+6. Preserve the user's requested subject.
   Example:
   Previous question:
   "What is the rent of the Inbound warehouse?"
@@ -372,19 +404,19 @@ RULES
   "What about the outbound one?"
   Rewrite as a question about the rent of the Outbound
   warehouse.
-5. If the current question is:
+7. If the current question is:
   "And the rate?"
   and the previous question was about the rent of the
   Inbound warehouse, preserve the previous subject and
   document unless another document is explicitly referenced.
-6. Do not invent a document name.
-7. Do not invent a business term, amount, date, person,
+8. Do not invent a document name.
+9. Do not invent a business term, amount, date, person,
   location, or other factual detail.
-8. If the relationship cannot be safely determined, return
+10. If the relationship cannot be safely determined, return
   the current question unchanged and set is_follow_up to
   false.
-9. Return ONLY valid JSON.
-10. Use exactly this JSON structure:
+11. Return ONLY valid JSON.
+12. Use exactly this JSON structure:
 {{
    "is_follow_up": true,
    "standalone_question": "rewritten question",
