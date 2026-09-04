@@ -1,4 +1,4 @@
-//gemini_service_py040926
+//gemini_service.py
 from urllib import response
 
 import google.generativeai as genai
@@ -193,37 +193,33 @@ def rewrite_followup_question(
   current_document=None,
 ):
   """
-  Rewrite a conversational follow-up question into a
-  standalone retrieval question.
-  The function does NOT answer the question.
-  Example:
-    Previous:
-    "What is the rent of the Inbound warehouse?"
-    Current:
-    "What about the outbound one?"
-    Result:
-    "What is the rent of the Outbound warehouse?"
-  The original question is returned unchanged when there is
-  not enough conversation context to safely rewrite it.
+  Rewrite a conversational follow-up into a standalone
+  retrieval question.
+  Gemini is used only for conversational rewriting.
+  Document selection remains deterministic:
+    1. explicit_document
+    2. current_document
+    3. current_documents[0]
+  Gemini must not override an explicitly selected document.
   """
-
-  # ========================================================
-  # SAFETY / EMPTY INPUT
-  # ========================================================
   if not question or not question.strip():
     return {
       "is_follow_up": False,
-      "standalone_question": question or "",
-      "target_document": explicit_document,
+      "standalone_question":
+        question or "",
+      "target_document":
+        explicit_document,
     }
 
-  current_question = question.strip()
+  current_question = (
+    question.strip()
+  )
 
   previous_question = (
     last_question.strip()
     if isinstance(
       last_question,
-      str
+      str,
     )
     else ""
   )
@@ -232,7 +228,7 @@ def rewrite_followup_question(
     last_answer.strip()
     if isinstance(
       last_answer,
-      str
+      str,
     )
     else ""
   )
@@ -241,16 +237,13 @@ def rewrite_followup_question(
     current_documents
     if isinstance(
       current_documents,
-      list
+      list,
     )
     else []
   )
 
   # ========================================================
   # NO PREVIOUS CONTEXT
-  #
-  # Without previous context, do not ask Gemini to invent
-  # a relationship.
   # ========================================================
   if (
     not previous_question
@@ -258,30 +251,18 @@ def rewrite_followup_question(
   ):
     return {
       "is_follow_up": False,
-      "standalone_question": current_question,
-      "target_document": explicit_document,
+      "standalone_question":
+        current_question,
+      "target_document":
+        explicit_document,
     }
 
-  # ========================================================
-  # LIMIT CONTEXT SIZE
-  #
-  # Previous answers can sometimes be large. We only need
-  # enough context to resolve references such as:
-  #
-  # "it"
-  # "that one"
-  # "outbound one"
-  # "the rate"
-  # ========================================================
   previous_answer_context = (
-    previous_answer[:4000]
+    previous_answer[:3000]
     if previous_answer
     else ""
   )
 
-  # ========================================================
-  # DOCUMENT LIST
-  # ========================================================
   document_list = "\n".join(
     f"- {filename}"
     for filename in documents
@@ -289,78 +270,67 @@ def rewrite_followup_question(
   )
 
   if not document_list:
-    document_list = "- No document list available"
-
-  resolved_document = (
-    explicit_document
-    if explicit_document
-    else "None"
-  )
-
-  active_document = (
-    current_document
-    if current_document
-    else None
-  )
+    document_list = (
+      "- No document list available"
+    )
 
   # ========================================================
-  # STRICT REWRITING PROMPT
+  # DETERMINISTIC DOCUMENT
+  # ========================================================
+  deterministic_document = (
+    explicit_document
+    or current_document
+  )
+
+  if (
+    not deterministic_document
+    and documents
+  ):
+    if len(documents) == 1:
+      deterministic_document = (
+        documents[0]
+      )
+
+  # ========================================================
+  # GEMINI PROMPT
   # ========================================================
   prompt = f"""
 You are a query-rewriting component inside an enterprise
-document RAG system.
-
-Your job is ONLY to determine whether the current question
-depends on the previous conversation and, if necessary,
-rewrite it into a standalone retrieval question.
-
+document question-answering system.
+Your ONLY job is to determine whether the CURRENT USER QUESTION
+is a conversational follow-up and, if necessary, rewrite it
+into a standalone retrieval question.
 DO NOT answer the question.
-
-DO NOT summarize the documents.
-
+DO NOT summarize documents.
 DO NOT invent facts.
-
-DO NOT add information that is not supported by the
-conversation.
-
+DO NOT invent document names.
 ============================================================
 PREVIOUS USER QUESTION
 ============================================================
 {previous_question}
-
 ============================================================
 PREVIOUS ANSWER
 ============================================================
 {previous_answer_context}
-
 ============================================================
 CURRENT USER QUESTION
 ============================================================
 {current_question}
-
 ============================================================
-AVAILABLE UPLOADED DOCUMENTS
+AVAILABLE DOCUMENTS
 ============================================================
 {document_list}
-
 ============================================================
-DETERMINISTICALLY RESOLVED DOCUMENT
+DETERMINISTIC CURRENT DOCUMENT
 ============================================================
-{resolved_document}
-
-============================================================
-CURRENT ACTIVE DOCUMENT
-============================================================
-{active_document}
-============================================================
- 
+{deterministic_document or "None"}
 ============================================================
 RULES
 ============================================================
-1. If the current question is already standalone, keep it
-  essentially unchanged.
-2. If the current question is a follow-up, resolve references
-  such as:
+1. If the current question is standalone, preserve it.
+2. If it is a follow-up, resolve conversational references
+  using the previous question and previous answer.
+3. Examples of follow-up references include:
   - it
   - its
   - this
@@ -369,64 +339,49 @@ RULES
   - that one
   - the other one
   - the second one
-  - outbound one
-  - inbound one
-  - the same
-  - and the rate
-  - what about renewal
-  using the previous question and conversation context.
-3. DOCUMENT PRIORITY:
-  If a document has been deterministically resolved from the
-  CURRENT USER QUESTION, that document is authoritative.
-  NEVER replace an explicitly resolved document with the
-  previous/current document.
-  Example:
-  Current question:
-  "What about AD Outbound?"
-  Deterministically resolved document:
-  "AD Outbound.pdf"
-  Even if the previous active document is:
-  "AD Inbound.pdf"
-  the target document MUST be:
-  "AD Outbound.pdf".
-4. If there is no explicit document in the current question,
-  use CURRENT ACTIVE DOCUMENT when resolving pronouns such as:
-  "it", "this", "that", "the document", "the agreement",
-  "its", or "who signed it".
-5. Only use another document when the current question explicitly
-  refers to another document or the conversation clearly establishes
-  that another document is intended.
-6. Preserve the user's requested subject.
-  Example:
-  Previous question:
-  "What is the rent of the Inbound warehouse?"
-  Current question:
-  "What about the outbound one?"
-  Rewrite as a question about the rent of the Outbound
-  warehouse.
-7. If the current question is:
-  "And the rate?"
-  and the previous question was about the rent of the
-  Inbound warehouse, preserve the previous subject and
-  document unless another document is explicitly referenced.
-8. Do not invent a document name.
-9. Do not invent a business term, amount, date, person,
-  location, or other factual detail.
-10. If the relationship cannot be safely determined, return
-  the current question unchanged and set is_follow_up to
-  false.
+  - the first one
+  - the rate
+  - the amount
+  - the rent
+  - renewal
+  - duration
+4. Preserve the SUBJECT of the previous question.
+Example:
+Previous:
+"What is the rent of the Inbound warehouse?"
+Current:
+"What about the outbound one?"
+Rewrite:
+"What is the rent of the Outbound warehouse?"
+5. If the current question says:
+"And the rate?"
+and the previous question was:
+"What is the rent of the Inbound warehouse?"
+preserve the subject and document.
+6. DOCUMENT PRIORITY IS DETERMINISTIC.
+If the deterministic current document is:
+{deterministic_document or "None"}
+DO NOT replace it.
+7. If a document is explicitly mentioned in the current
+question, that document must take priority over the previous
+active document.
+8. Do not invent a filename.
+9. Do not invent amounts, dates, names, companies,
+designations, clauses, or other facts.
+10. If the relationship cannot be safely determined, keep the
+current question unchanged and set is_follow_up to false.
 11. Return ONLY valid JSON.
-12. Use exactly this JSON structure:
+12. Return exactly:
 {{
    "is_follow_up": true,
-   "standalone_question": "rewritten question",
-   "target_document": "document filename or null"
+   "standalone_question": "rewritten question"
 }}
-============================================================
+or:
+{{
+   "is_follow_up": false,
+   "standalone_question": "current question"
+}}
 """
-  # ========================================================
-  # CALL GEMINI
-  # ========================================================
   try:
     response = model.generate_content(
       prompt
@@ -436,16 +391,12 @@ RULES
       getattr(
         response,
         "text",
-        ""
+        "",
       )
       or ""
     ).strip()
 
     if not response_text:
-      logger.warning(
-        "Follow-up rewriter returned empty response."
-      )
-
       return {
         "is_follow_up": False,
         "standalone_question":
@@ -454,9 +405,6 @@ RULES
           explicit_document,
       }
 
-    # ====================================================
-    # REMOVE MARKDOWN JSON FENCE IF GEMINI ADDS ONE
-    # ====================================================
     response_text = re.sub(
       r"^```(?:json)?\s*",
       "",
@@ -470,9 +418,6 @@ RULES
       response_text,
     ).strip()
 
-    # ====================================================
-    # PARSE JSON
-    # ====================================================
     parsed = json.loads(
       response_text
     )
@@ -480,7 +425,7 @@ RULES
     is_follow_up = bool(
       parsed.get(
         "is_follow_up",
-        False
+        False,
       )
     )
 
@@ -490,18 +435,9 @@ RULES
       )
     )
 
-    target_document = (
-      parsed.get(
-        "target_document"
-      )
-    )
-
-    # ====================================================
-    # VALIDATE REWRITTEN QUESTION
-    # ====================================================
     if not isinstance(
       standalone_question,
-      str
+      str,
     ):
       standalone_question = (
         current_question
@@ -517,55 +453,16 @@ RULES
       )
 
     # ====================================================
-    # VALIDATE TARGET DOCUMENT
-    #
-    # Gemini must not invent a filename.
+    # IMPORTANT:
+    # GEMINI DOES NOT CONTROL DOCUMENT SELECTION
     # ====================================================
-    if target_document:
-      target_document = (
-        str(
-          target_document
-        ).strip()
-      )
-
-      if (
-        target_document
-        not in documents
-      ):
-        logger.warning(
-          "Follow-up rewriter returned "
-          "unknown document: %s",
-          target_document,
-        )
-
-        target_document = (
-          explicit_document
-        )
-    else:
-      target_document = (
-        explicit_document
-      )
-
-    # ====================================================
-    # LOG RESULT
-    # ====================================================
-    logger.info(
-      "Follow-up rewrite completed | "
-      "original=%s | follow_up=%s | "
-      "rewritten=%s | target_document=%s",
-      current_question,
-      is_follow_up,
-      standalone_question,
-      target_document,
-    )
-
     return {
       "is_follow_up":
         is_follow_up,
       "standalone_question":
         standalone_question,
       "target_document":
-        target_document,
+        explicit_document,
     }
 
   except json.JSONDecodeError as exc:
@@ -574,31 +471,16 @@ RULES
       exc,
     )
 
-    return {
-      "is_follow_up": False,
-      "standalone_question":
-        current_question,
-      "target_document":
-        explicit_document,
-    }
-
   except Exception as exc:
     logger.exception(
       "Follow-up question rewriting failed: %s",
       exc,
     )
 
-    # ----------------------------------------------------
-    # Fail safely.
-    #
-    # If rewriting fails, use the original question.
-    # This means the new functionality cannot break the
-    # existing RAG pipeline.
-    # ----------------------------------------------------
-    return {
-      "is_follow_up": False,
-      "standalone_question":
-        current_question,
-      "target_document":
-        explicit_document,
-    }
+  return {
+    "is_follow_up": False,
+    "standalone_question":
+      current_question,
+    "target_document":
+      explicit_document,
+  }
