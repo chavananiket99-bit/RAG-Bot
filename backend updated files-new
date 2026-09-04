@@ -1,2738 +1,833 @@
-//gemini_service.py
-import google.generativeai as genai
-import os
-import json
-import re
+//pdf_service.py
 import logging
+from services.pdf_reader import read_pdf
+from services.ocr_reader import read_scanned_pdf
+from services.chunk_service import split_text
 
-from dotenv import load_dotenv
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-3.5-flash")
+MIN_USABLE_TEXT_LENGTH = 20
 
-def ask_gemini(context, question):
-   normalized_question = question.lower()
-   signature_keywords = [
-       "signatory",
-       "signatories",
-       "signature",
-       "signatures",
-       "signed",
-       "signed by",
-       "who signed",
-       "authorized signatory",
-       "authorised signatory",
-       "esign",
-       "e sign",
-   ]
-   is_signature_question = any(
-       keyword in normalized_question
-       for keyword in signature_keywords
-   )
-   if is_signature_question:
-       prompt = f"""
-You are an enterprise document question-answering assistant.
-You must answer the user's question using ONLY the supplied
-document context.
-The user is asking specifically about a SIGNATORY / SIGNATURE.
-STRICT SIGNATORY RULES:
-1. Identify a person's name as a signatory ONLY when the
-  retrieved document context explicitly connects that person
-  to a signature, signed section, authorized signatory section,
-  electronic signature, "signed by" section, or equivalent.
-2. Do NOT assume that a person's name is a signatory merely
-  because the name appears somewhere in the document.
-3. Do NOT infer or guess which company a person represents.
-4. A person's company/organization must be stated explicitly
-  in the same relevant document context.
-5. Do NOT combine a person's name from one chunk with a company
-  name from another unrelated chunk unless the context clearly
-  establishes that relationship.
-6. If the document identifies the person but does not explicitly
-  identify the company they represent, report the person's name
-  and say that the company association is not specified.
-7. Preserve names exactly as they appear in the document.
-  Do not correct spelling based on outside knowledge.
-8. If multiple people are explicitly identified as signatories,
-  list each person separately.
-9. If the document contains different amendments or agreements,
-  do not mix signatories from different agreements unless the
-  context explicitly connects them to the agreement in the
-  user's question.
-10. If the retrieved context does not contain enough evidence
-   to identify the signatory, reply exactly:
-"I couldn't find that information in the uploaded document."
-11. Do not use outside knowledge.
-12. Do not mention FAISS, embeddings, retrieval, chunks,
-   vector search, RRF, BM25, or internal implementation.
-RESPONSE FORMAT FOR SIGNATORY QUESTIONS:
-If explicitly supported:
-"The document identifies the following signatory/signatories:
-- Name: <exact name>
- Company/Organization: <company only if explicitly stated>
- Designation: <designation only if explicitly stated>"
-If the company or designation is not explicitly stated,
-omit it or say:
-"Company/Organization: Not specified in the document."
-DOCUMENT CONTEXT:
-{context}
-USER QUESTION:
-{question}
-ANSWER:
-"""
-   else:
-       prompt = f"""
-You are an enterprise document question-answering assistant.
-Your task is to answer the user's question using ONLY the
-information contained in the provided document context.
-IMPORTANT RULES:
-1. Do not use outside knowledge.
-2. Do not guess or infer facts that are not supported by
-  the document context.
-3. If multiple documents are provided, use only the documents
-  that contain information relevant to the question.
-4. Ignore irrelevant document chunks.
-5. If the context does not contain enough information to answer
-  the question, reply exactly:
-"I couldn't find that information in the uploaded document."
-6. When the answer contains a number, amount, date, name,
-  percentage, duration, or other specific value, preserve the
-  value exactly as supported by the document.
-7. Give a concise and direct answer.
-8. Do not combine unrelated pieces of information merely because
-  they appear in different document chunks.
-9. Do not infer relationships between people, companies,
-  agreements, dates, amounts, or clauses unless the document
-  explicitly establishes that relationship.
-10. Do not mention retrieval, embeddings, FAISS, BM25, RRF,
-   chunks, or internal implementation details.
-DOCUMENT CONTEXT:
-{context}
-USER QUESTION:
-{question}a
-"""
-   response = model.generate_content(
-       prompt
-   )
-   return response.text
+def _has_usable_text(pages):
+    """
+    Determine whether normal PDF extraction produced meaningful text.
+    Some PDFs technically return a few characters, whitespace,
+    page numbers, or garbage text even though OCR is required.
+    """
+    if not pages:
+        return False
 
-# ============================================================
-# FOLLOW-UP QUESTION REWRITER
-# ============================================================
-def rewrite_followup_question(
-  question,
-  last_question=None,
-  last_answer=None,
-  current_documents=None,
-  explicit_document=None,
-):
-  """
-  Rewrite a conversational follow-up question into a
-  standalone retrieval question.
-  The function does NOT answer the question.
-  Example:
-    Previous:
-    "What is the rent of the Inbound warehouse?"
-    Current:
-    "What about the outbound one?"
-    Result:
-    "What is the rent of the Outbound warehouse?"
-  The original question is returned unchanged when there is
-  not enough conversation context to safely rewrite it.
-  """
-
-  # ========================================================
-  # SAFETY / EMPTY INPUT
-  # ========================================================
-  if not question or not question.strip():
-    return {
-      "is_follow_up": False,
-      "standalone_question": question or "",
-      "target_document": explicit_document,
-    }
-
-  current_question = question.strip()
-
-  previous_question = (
-    last_question.strip()
-    if isinstance(
-      last_question,
-      str
-    )
-    else ""
-  )
-
-  previous_answer = (
-    last_answer.strip()
-    if isinstance(
-      last_answer,
-      str
-    )
-    else ""
-  )
-
-  documents = (
-    current_documents
-    if isinstance(
-      current_documents,
-      list
-    )
-    else []
-  )
-
-  # ========================================================
-  # NO PREVIOUS CONTEXT
-  #
-  # Without previous context, do not ask Gemini to invent
-  # a relationship.
-  # ========================================================
-  if (
-    not previous_question
-    and not previous_answer
-  ):
-    return {
-      "is_follow_up": False,
-      "standalone_question": current_question,
-      "target_document": explicit_document,
-    }
-
-  # ========================================================
-  # LIMIT CONTEXT SIZE
-  #
-  # Previous answers can sometimes be large. We only need
-  # enough context to resolve references such as:
-  #
-  # "it"
-  # "that one"
-  # "outbound one"
-  # "the rate"
-  # ========================================================
-  previous_answer_context = (
-    previous_answer[:4000]
-    if previous_answer
-    else ""
-  )
-
-  # ========================================================
-  # DOCUMENT LIST
-  # ========================================================
-  document_list = "\n".join(
-    f"- {filename}"
-    for filename in documents
-    if filename
-  )
-
-  if not document_list:
-    document_list = "- No document list available"
-
-  resolved_document = (
-    explicit_document
-    if explicit_document
-    else "None"
-  )
-
-  # ========================================================
-  # STRICT REWRITING PROMPT
-  # ========================================================
-  prompt = f"""
-You are a query-rewriting component inside an enterprise
-document RAG system.
-
-Your job is ONLY to determine whether the current question
-depends on the previous conversation and, if necessary,
-rewrite it into a standalone retrieval question.
-
-DO NOT answer the question.
-
-DO NOT summarize the documents.
-
-DO NOT invent facts.
-
-DO NOT add information that is not supported by the
-conversation.
-
-============================================================
-PREVIOUS USER QUESTION
-============================================================
-{previous_question}
-
-============================================================
-PREVIOUS ANSWER
-============================================================
-{previous_answer_context}
-
-============================================================
-CURRENT USER QUESTION
-============================================================
-{current_question}
-
-============================================================
-AVAILABLE UPLOADED DOCUMENTS
-============================================================
-{document_list}
-
-============================================================
-DETERMINISTICALLY RESOLVED DOCUMENT
-============================================================
-{resolved_document}
-
-============================================================
-RULES
-============================================================
-1. If the current question is already standalone, keep it
-  essentially unchanged.
-2. If the current question is a follow-up, resolve references
-  such as:
-  - it
-  - its
-  - this
-  - that
-  - this one
-  - that one
-  - the other one
-  - the second one
-  - outbound one
-  - inbound one
-  - the same
-  - and the rate
-  - what about renewal
-  using the previous question and conversation context.
-3. If a document has been deterministically resolved,
-  prefer that document when resolving the follow-up.
-4. Preserve the user's requested subject.
-  Example:
-  Previous question:
-  "What is the rent of the Inbound warehouse?"
-  Current question:
-  "What about the outbound one?"
-  Rewrite as a question about the rent of the Outbound
-  warehouse.
-5. If the current question is:
-  "And the rate?"
-  and the previous question was about the rent of the
-  Inbound warehouse, preserve the previous subject and
-  document unless another document is explicitly referenced.
-6. Do not invent a document name.
-7. Do not invent a business term, amount, date, person,
-  location, or other factual detail.
-8. If the relationship cannot be safely determined, return
-  the current question unchanged and set is_follow_up to
-  false.
-9. Return ONLY valid JSON.
-10. Use exactly this JSON structure:
-{{
-   "is_follow_up": true,
-   "standalone_question": "rewritten question",
-   "target_document": "document filename or null"
-}}
-============================================================
-"""
-  # ========================================================
-  # CALL GEMINI
-  # ========================================================
-  try:
-    response = model.generate_content(
-      prompt
-    )
-
-    response_text = (
-      getattr(
-        response,
-        "text",
-        ""
-      )
-      or ""
+    extracted_text = "\n".join(
+        str(page.get("text", "") or "")
+        for page in pages
     ).strip()
 
-    if not response_text:
-      logger.warning(
-        "Follow-up rewriter returned empty response."
-      )
+    if len(extracted_text) < MIN_USABLE_TEXT_LENGTH:
+        return False
 
-      return {
-        "is_follow_up": False,
-        "standalone_question":
-          current_question,
-        "target_document":
-          explicit_document,
-      }
-
-    # ====================================================
-    # REMOVE MARKDOWN JSON FENCE IF GEMINI ADDS ONE
-    # ====================================================
-    response_text = re.sub(
-      r"^```(?:json)?\s*",
-      "",
-      response_text,
-      flags=re.IGNORECASE,
+    # Remove whitespace and check whether we have actual content.
+    compact_text = "".join(
+        extracted_text.split()
     )
 
-    response_text = re.sub(
-      r"\s*```$",
-      "",
-      response_text,
+    return len(compact_text) >= MIN_USABLE_TEXT_LENGTH
+
+def _build_full_text(pages):
+    """
+    Build full document text while preserving page order.
+    """
+    return "\n".join(
+        str(page.get("text", "") or "").strip()
+        for page in pages
+        if page.get("text")
     ).strip()
 
-    # ====================================================
-    # PARSE JSON
-    # ====================================================
-    parsed = json.loads(
-      response_text
-    )
-
-    is_follow_up = bool(
-      parsed.get(
-        "is_follow_up",
-        False
-      )
-    )
-
-    standalone_question = (
-      parsed.get(
-        "standalone_question"
-      )
-    )
-
-    target_document = (
-      parsed.get(
-        "target_document"
-      )
-    )
-
-    # ====================================================
-    # VALIDATE REWRITTEN QUESTION
-    # ====================================================
-    if not isinstance(
-      standalone_question,
-      str
-    ):
-      standalone_question = (
-        current_question
-      )
-
-    standalone_question = (
-      standalone_question.strip()
-    )
-
-    if not standalone_question:
-      standalone_question = (
-        current_question
-      )
-
-    # ====================================================
-    # VALIDATE TARGET DOCUMENT
-    #
-    # Gemini must not invent a filename.
-    # ====================================================
-    if target_document:
-      target_document = (
-        str(
-          target_document
-        ).strip()
-      )
-
-      if (
-        target_document
-        not in documents
-      ):
-        logger.warning(
-          "Follow-up rewriter returned "
-          "unknown document: %s",
-          target_document,
-        )
-
-        target_document = (
-          explicit_document
-        )
-    else:
-      target_document = (
-        explicit_document
-      )
-
-    # ====================================================
-    # LOG RESULT
-    # ====================================================
-    logger.info(
-      "Follow-up rewrite completed | "
-      "original=%s | follow_up=%s | "
-      "rewritten=%s | target_document=%s",
-      current_question,
-      is_follow_up,
-      standalone_question,
-      target_document,
-    )
-
-    return {
-      "is_follow_up":
-        is_follow_up,
-      "standalone_question":
-        standalone_question,
-      "target_document":
-        target_document,
-    }
-
-  except json.JSONDecodeError as exc:
-    logger.warning(
-      "Follow-up rewriter returned invalid JSON: %s",
-      exc,
-    )
-
-    return {
-      "is_follow_up": False,
-      "standalone_question":
-        current_question,
-      "target_document":
-        explicit_document,
-    }
-
-  except Exception as exc:
-    logger.exception(
-      "Follow-up question rewriting failed: %s",
-      exc,
-    )
-
-    # ----------------------------------------------------
-    # Fail safely.
-    #
-    # If rewriting fails, use the original question.
-    # This means the new functionality cannot break the
-    # existing RAG pipeline.
-    # ----------------------------------------------------
-    return {
-      "is_follow_up": False,
-      "standalone_question":
-        current_question,
-      "target_document":
-        explicit_document,
-    }
-
-//app.py
-from fastapi.openapi.utils import get_openapi
-
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    Request,
-    HTTPException,
-    Depends,
-)
-
-from typing import Annotated
-
-from fastapi.middleware.cors import CORSMiddleware
-
-import shutil
-import os
-import time
-import logging
-import uuid
-import re
-
-from pathlib import Path
-
-from services.pdf_service import extract_text
-from models.question import QuestionRequest
-from services.vector_store import vector_store
-from services.gemini_service import ( ask_gemini, rewrite_followup_question )
-from services.document_manager import document_manager
-from services.auth_dependency import get_current_user
-from services.conversation_service import conversation_service
-
-from routers.auth import router as auth_router
-
-
-# ============================================================
-# APP
-# ============================================================
-
-app = FastAPI()
-
-app.include_router(
-    auth_router
-)
-
-logger = logging.getLogger(
-    "uvicorn.error"
-)
-
-
-# ============================================================
-# CORS
-# ============================================================
-
-app.add_middleware(
-    CORSMiddleware,
-
-    allow_origins=[
-        "http://localhost:5173",
-        "https://apc01.safelinks.protection.outlook.com/?url=http%3A%2F%2F127.0.0.1%3A5173%2F&data=05%7C02%7Cchavan.aniket%40mahindra.com%7C1d21484b21bf4136feb308df07f669c9%7C8c4858b5f020483ab7ef71ded6e81767%7C0%7C0%7C639238427074011872%7CUnknown%7CTWFpbGZsb3d8eyJFbXB0eU1hcGkiOnRydWUsIlYiOiIwLjAuMDAwMCIsIlAiOiJXaW4zMiIsIkFOIjoiTWFpbCIsIldUIjoyfQ%3D%3D%7C0%7C%7C%7C&sdata=0jeosLYJzix%2F4anrrZfTOlG34fqHgi%2BF41v2wjXPPHU%3D&reserved=0",
-    ],
-
-    allow_credentials=True,
-
-    allow_methods=["*"],
-
-    allow_headers=["*"],
-)
-
-
-# ============================================================
-# DIRECTORIES
-# ============================================================
-
-BASE_DIR = Path(
-    __file__
-).resolve().parent
-
-UPLOAD_FOLDER = (
-    BASE_DIR / "uploads"
-)
-
-UPLOAD_FOLDER.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-# ============================================================
-# CONVERSATION FOLLOW-UP HELPERS
-# ============================================================
-def _normalize_document_name(filename):
+def extract_text(pdf_path):
     """
-    Normalize a document filename for comparison.
-    """
-    if not filename:
-       return ""
-
-    return re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        Path(filename).stem.lower(),
-    ).strip()
-
-def _document_reference_score(
-    question,
-    filename,
-):
-    """
-    Determine whether the question explicitly refers
-    to a particular uploaded document.
-    This is deterministic and does not use Gemini.
-    """
-    if not question or not filename:
-        return 0.0
-
-    question_text = re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        question.lower(),
-    ).strip()
-
-    filename_text = _normalize_document_name(
-        filename
-    )
-
-    if not question_text or not filename_text:
-        return 0.0
-
-    question_tokens = set(
-        question_text.split()
-    )
-
-    filename_tokens = set(
-        filename_text.split()
-    )
-
-    if not question_tokens or not filename_tokens:
-        return 0.0
-
-    # --------------------------------------------------------
-    # Common aliases
-    # --------------------------------------------------------
-    aliases = {
-        "wh": "warehouse",
-        "whs": "warehouse",
-        "warehouses": "warehouse",
-        "off": "office",
-        "offs": "office",
-        "offices": "office",
-        "out": "outbound",
-        "in": "inbound",
-    }
-
-    question_tokens = {
-        aliases.get(
-            token,
-            token
-        )
-        for token in question_tokens
-    }
-
-    filename_tokens = {
-        aliases.get(
-            token,
-            token
-        )
-        for token in filename_tokens
-    }
-
-    # --------------------------------------------------------
-    # Ignore generic words
-    # --------------------------------------------------------
-    generic_terms = {
-        "what",
-        "is",
-        "are",
-        "was",
-        "were",
-        "the",
-        "a",
-        "an",
-        "of",
-        "for",
-        "to",
-        "in",
-        "on",
-        "at",
-        "and",
-        "or",
-        "with",
-        "from",
-        "by",
-        "how",
-        "much",
-        "about",
-        "this",
-        "that",
-        "one",
-        "document",
-        "file",
-        "pdf",
-        "same",
-        "also",
-        "please",
-        "tell",
-        "me",
-    }
-
-    question_tokens -= generic_terms
-    filename_tokens -= generic_terms
-
-    if not question_tokens or not filename_tokens:
-        return 0.0
-
-    overlap = (
-        question_tokens
-        .intersection(
-            filename_tokens
-        )
-    )
-    if not overlap:
-        return 0.0
-
-    # --------------------------------------------------------
-    # Score
-    # --------------------------------------------------------
-    query_coverage = (
-        len(overlap)
-        / len(question_tokens)
-    )
-
-    filename_coverage = (
-        len(overlap)
-        / len(filename_tokens)
-    )
-
-    score = (
-        query_coverage * 0.60
-        + filename_coverage * 0.40
-    )
-
-    return min(
-        1.0,
-        float(score)
-    )
-
-def _detect_explicit_document(
-    question,
-    available_documents,
-):
-    """
-    Find an explicitly referenced document.
+    Extract text from a PDF.
+    Processing flow:
+        PDF
+            |
+            +--> Normal text extraction
+            |
+            +--> Usable text?
+                    |
+                +----+----+
+                |         |
+                YES       NO
+                |         |
+                |        OCR
+                |         |
+                +----+----+
+                    |  
+                Page-aware
+                chunks
+    
     Returns:
-        filename or None
-    """
-
-    if not question:
-        return None
-
-    if not available_documents:
-        return None
-
-    scored_documents = []
-
-    for filename in available_documents:
-        score = _document_reference_score(
-            question,
-            filename,
-        )
-
-        if score <= 0:
-            continue
-
-        scored_documents.append(
-            (
-                score,
-                filename,
-            )
-        )
-
-    if not scored_documents:
-        return None
-
-    scored_documents.sort(
-        key=lambda item: item[0],
-        reverse=True,
-    )
-
-    best_score, best_filename = (
-        scored_documents[0]
-    )
-
-    # Require meaningful document overlap.
-    if best_score < 0.40:
-        return None
-
-    # Avoid ambiguous matches.
-    if len(scored_documents) > 1:
-        second_score = (
-            scored_documents[1][0]
-        )
-
-        if (
-            abs(
-                best_score
-                - second_score
-            )
-            < 0.10
-        ):
-           return None
-
-    logger.info(
-        "Explicit document detected | "
-        "question=%s | document=%s | score=%.3f",
-        question,
-        best_filename,
-        best_score,
-    )
-
-    return best_filename
-
-def _detect_follow_up_question(
-    question,
-    last_question=None,
-    last_answer=None,
-    current_documents=None,
-):
-    """
-    Conservative follow-up detection.
-    Returns True only when the new question appears to
-    depend on the previous conversation.
-    """
-    if not question:
-        return False
-
-    normalized = re.sub(
-        r"\s+",
-        " ",
-        question.lower(),
-    ).strip()
-
-    if not normalized:
-        return False
-
-    # --------------------------------------------------------
-    # Explicit follow-up phrases
-    # --------------------------------------------------------
-    follow_up_patterns = [
-        r"\bwhat about\b",
-        r"\bhow about\b",
-        r"\band the\b",
-        r"\band for\b",
-        r"\band what about\b",
-        r"\bwhat of\b",
-        r"\bthe other one\b",
-        r"\bthe other document\b",
-        r"\bthe second one\b",
-        r"\bthe first one\b",
-        r"\bthis one\b",
-        r"\bthat one\b",
-        r"\bsame for\b",
-        r"\bsame as\b",
-        r"\bwhat about its\b",
-        r"\bwhat about their\b",
-        r"\band the same\b",
-    ]
-
-    if any(
-        re.search(
-            pattern,
-            normalized,
-        )
-        for pattern in follow_up_patterns
-    ):
-        return bool(
-            last_question
-            or last_answer
-            or current_documents
-        )
-
-    # --------------------------------------------------------
-    # Pronoun/reference-based short questions
-    # --------------------------------------------------------
-    reference_words = {
-        "it",
-        "its",
-        "they",
-        "their",
-        "them",
-        "that",
-        "this",
-        "one",
-        "same",
-        "other",
-    }
-
-    tokens = set(
-        re.findall(
-            r"\b[a-z0-9]+\b",
-            normalized,
-        )
-    )
-
-    if (
-        tokens.intersection(
-            reference_words
-        )
-        and (
-            last_question
-            or last_answer
-            or current_documents
-        )
-    ):
-        return True
-
-    # --------------------------------------------------------
-    # Very short questions following an existing question
-    #
-    # Examples:
-    #
-    # "And the rate?"
-    # "And renewal?"
-    # "The duration?"
-    # --------------------------------------------------------
-    question_tokens = re.findall(
-        r"\b[a-z0-9]+\b",
-        normalized,
-    )
-
-    if (
-        last_question
-        and len(question_tokens) <= 5
-    ):
-        follow_up_starters = {
-            "and",
-            "also",
-            "then",
-            "what",
-            "how",
-            "the",
-            "about",
+        {
+            "text": str,
+            "pages": list[dict],
+            "chunks": list[dict],
+            "ocr_used": bool
         }
-
-        if (
-            question_tokens
-            and question_tokens[0]
-            in follow_up_starters
-        ):
-            return True
-
-    return False
-
-
-# ============================================================
-# REQUEST LOGGING
-# ============================================================
-
-@app.middleware("http")
-async def log_requests(
-    request: Request,
-    call_next
-):
-
-    start_time = time.time()
+    """
 
     logger.info(
-        "Request started: %s %s",
-        request.method,
-        request.url.path,
+        "Extracting text from PDF: %s",
+        pdf_path
     )
 
-    response = await call_next(
-        request
-    )
+    # ============================================================
+    # STEP 1 — NORMAL TEXT EXTRACTION
+    # ============================================================
+    try:
+        pages = read_pdf(pdf_path)
 
-    duration_ms = (
-        time.time()
-        - start_time
-    ) * 1000
+    except Exception as exc:
+        logger.exception(
+            "Normal PDF text extraction failed: %s",
+            exc
+        )
 
-    logger.info(
-        "Request completed: %s %s -> %s (%.2f ms)",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration_ms,
-    )
+        pages = []
 
-    return response
+    if pages is None:
+        pages = []
 
+    # ============================================================
+    # STEP 2 — CHECK WHETHER NORMAL EXTRACTION IS USABLE
+    # ============================================================
+    ocr_used = False
 
-# ============================================================
-# HOME
-# ============================================================
-
-@app.get("/")
-def home():
-
-    return {
-        "message":
-            "PDF RAG Backend Running"
-    }
-
-
-# ============================================================
-# UPLOAD
-# ============================================================
-
-@app.post("/upload")
-async def upload_files(
-    files: Annotated[
-        list[UploadFile],
-        File(...)
-    ],
-    current_user: dict = Depends(
-        get_current_user
-    ),
-):
-
-    logger.info(
-        "Multiple upload request received. Files: %s",
-        len(files)
-    )
-
-    uploaded_documents = []
-    failed_documents = []
-
-    user_id = current_user["id"]
-
-    for file in files:
-
-        original_filename = Path(
-            file.filename
-            or "uploaded_file.pdf"
-        ).name
-
-        stored_filename = None
-        file_path = None
-        document = None
-
+    if not _has_usable_text(pages):
         logger.info(
-            "Processing uploaded file: %s",
-            original_filename
+            "PDF does not contain sufficient usable text. "
+            "Performing OCR: %s",
+            pdf_path
         )
 
         try:
-
-            # ====================================================
-            # SAVE PHYSICAL FILE
-            # ====================================================
-
-            unique_id = (
-                uuid.uuid4().hex
-            )
-
-            stored_filename = (
-                f"{unique_id}_{original_filename}"
-            )
-
-            file_path = (
-                UPLOAD_FOLDER
-                / stored_filename
-            )
-
-            with open(
-                file_path,
-                "wb"
-            ) as buffer:
-
-                shutil.copyfileobj(
-                    file.file,
-                    buffer
-                )
-
-            file_size = (
-                os.path.getsize(
-                    file_path
-                )
-            )
-
-            logger.info(
-                "File saved: %s | bytes=%s",
-                original_filename,
-                file_size
-            )
-
-            # ====================================================
-            # EXTRACT PDF
-            # ====================================================
-
-            result = extract_text(
-                str(file_path)
-            )
-
-            text = result.get(
-                "text",
-                ""
-            )
-
-            pages = result.get(
-                "pages",
-                []
-            )
-
-            chunks = result.get(
-                "chunks",
-                []
-            )
-
-            ocr_used = result.get(
-                "ocr_used",
-                False
-            )
-
-            logger.info(
-                "Text extraction completed: %s | "
-                "Characters=%s | Pages=%s | "
-                "Chunks=%s | OCR=%s",
-                original_filename,
-                len(text),
-                len(pages),
-                len(chunks),
-                ocr_used,
-            )
-
-            if not chunks:
-
-                raise ValueError(
-                    "No text chunks could be extracted "
-                    "from the PDF."
-                )
-
-            # ====================================================
-            # CREATE DOCUMENT METADATA
-            # ====================================================
-
-            document = (
-                document_manager.add_document(
-                    filename=original_filename,
-                    filesize=file_size,
-                    stored_filename=stored_filename,
-                    user_id=user_id,
-                )
-            )
-
-            # ====================================================
-            # ADD TO FAISS
-            # ====================================================
-
-            faiss_chunks_added = (
-                vector_store.add_document(
-                    document_id=document["id"],
-                    filename=original_filename,
-                    chunks=chunks,
-                    user_id=user_id,
-                )
-            )
-
-            if (
-                faiss_chunks_added
-                != len(chunks)
-            ):
-
-                raise RuntimeError(
-                    "FAISS indexing did not add "
-                    "all document chunks."
-                )
-
-            logger.info(
-                "FAISS indexing completed: %s | chunks=%s",
-                original_filename,
-                faiss_chunks_added
-            )
-
-            # ====================================================
-            # SUCCESS
-            # ====================================================
-
-            uploaded_documents.append(
-                {
-                    "document":
-                        document,
-
-                    "characters":
-                        len(text),
-
-                    "pages":
-                        len(pages),
-
-                    "chunks":
-                        len(chunks),
-
-                    "faiss_chunks_added":
-                        faiss_chunks_added,
-
-                    "ocr_used":
-                        ocr_used,
-
-                    "preview":
-                        text[:500],
-                }
-            )
+            pages = read_scanned_pdf(pdf_path)
+            ocr_used = True
 
         except Exception as exc:
-
             logger.exception(
-                "Failed to process file: %s",
-                original_filename
+                "OCR extraction failed: %s",
+                exc
             )
 
-            # ====================================================
-            # ROLLBACK FAISS
-            # ====================================================
+            raise RuntimeError(
+                "Unable to extract text from PDF."
+            ) from exc
 
-            if document:
+    if pages is None:
+        pages = []
 
-                try:
+    # ============================================================
+    # STEP 3 — BUILD FULL TEXT
+    # ============================================================
+    text = _build_full_text(pages)
 
-                    vector_store.delete_document(
-                        document["id"]
-                    )
+    # ============================================================
+    # STEP 4 — CHUNKING
+    # ============================================================
+    chunks = []
 
-                except Exception:
+    if pages:
+        try:
+            chunks = split_text(pages)
 
-                    logger.exception(
-                        "FAISS rollback failed for %s",
-                        original_filename
-                    )
-
-                # ------------------------------------------------
-                # Roll back document metadata if possible.
-                # ------------------------------------------------
-
-                try:
-
-                    document_manager.delete_document(
-                        document["id"]
-                    )
-
-                except Exception:
-
-                    logger.exception(
-                        "Document metadata rollback failed "
-                        "for %s",
-                        original_filename
-                    )
-
-            # ====================================================
-            # ROLLBACK PHYSICAL FILE
-            # ====================================================
-
-            try:
-
-                if (
-                    file_path
-                    and file_path.exists()
-                ):
-
-                    file_path.unlink()
-
-                    logger.info(
-                        "Rolled back physical file: %s",
-                        file_path
-                    )
-
-            except Exception:
-
-                logger.exception(
-                    "Failed to remove incomplete file: %s",
-                    original_filename
-                )
-
-            failed_documents.append(
-                {
-                    "filename":
-                        original_filename,
-
-                    "error":
-                        str(exc),
-                }
+        except Exception as exc:
+            logger.exception(
+                "PDF chunking failed: %s",
+                exc
             )
 
+            raise RuntimeError(
+                "Unable to create document chunks."
+            ) from exc
+
+    if chunks is None:
+        chunks = []
+
+    # ============================================================
+    # STEP 5 — LOGGING
+    # ============================================================
     logger.info(
-        "Multiple upload completed. "
-        "Success=%s | Failed=%s",
-        len(uploaded_documents),
-        len(failed_documents)
+        "PDF processing completed | "
+        "Pages=%s | Characters=%s | Chunks=%s | OCR=%s",
+        len(pages),
+        len(text),
+        len(chunks),
+        ocr_used,
     )
 
     return {
-
-        "message":
-            "Upload processing completed.",
-
-        "total_files":
-            len(files),
-
-        "successful_files":
-            len(uploaded_documents),
-
-        "failed_files":
-            len(failed_documents),
-
-        "documents":
-            uploaded_documents,
-
-        "failures":
-            failed_documents,
+        "text": text,
+        "pages": pages,
+        "chunks": chunks,
+        "ocr_used": ocr_used,
     }
 
+//document_manager.py
+import json
+import logging
+import uuid
+from pathlib import Path
+from datetime import datetime
 
-# ============================================================
-# ASK
-# ============================================================
+logger = logging.getLogger("uvicorn.error")
 
-@app.post("/ask")
-async def ask_question(
-    request: QuestionRequest,
-    current_user: dict = Depends(
-        get_current_user
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+METADATA_DIR = BASE_DIR / "metadata"
+METADATA_FILE = METADATA_DIR / "documents.json"
+
+class DocumentManager:
+    def __init__(self):
+        METADATA_DIR.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        if not METADATA_FILE.exists():
+            self._atomic_write([])
+
+    # ============================================================
+    # INTERNAL WRITE
+    # ============================================================
+    def _atomic_write(self, documents):
+        temp_file = (
+            METADATA_FILE.with_suffix(".tmp")
+        )
+
+        try:
+            with open(
+                temp_file,
+                "w",
+                encoding="utf-8"
+            ) as file:
+                json.dump(
+                    documents,
+                    file,
+                    indent=4,
+                    ensure_ascii=False
+                )
+
+                file.flush()
+
+            temp_file.replace(
+                METADATA_FILE
+            )
+
+        except Exception:
+            if temp_file.exists():
+                temp_file.unlink(
+                    missing_ok=True
+                )
+            raise
+
+    # ============================================================
+    # GET DOCUMENTS
+    # ============================================================
+    def get_documents(self):
+        if not METADATA_FILE.exists():
+            return []
+
+        try:
+            with open(
+                METADATA_FILE,
+                "r",
+                encoding="utf-8"
+            ) as file:
+                data = json.load(file)
+
+            if not isinstance(data, list):
+                logger.warning(
+                    "documents.json does not contain a list. "
+                    "Returning empty document list."
+                )
+                return []
+            return data
+
+        except json.JSONDecodeError as exc:
+            logger.exception(
+                "documents.json is corrupted: %s",
+                exc
+            )
+
+            raise RuntimeError(
+                "Document metadata is corrupted."
+            ) from exc
+
+    # ============================================================
+    # SAVE DOCUMENTS
+    # ============================================================
+    def save_documents(self, documents):
+        if not isinstance(documents, list):
+            raise ValueError(
+                "documents must be a list."
+            )
+        self._atomic_write(
+            documents
+        )
+
+    # ============================================================
+    # ADD DOCUMENT
+    # ============================================================
+    def add_document(
+        self,
+        filename,
+        filesize,
+        stored_filename=None,
+        user_id=None
+    ):
+        documents = self.get_documents()
+        document = {
+            "id": str(uuid.uuid4()),
+            "filename": filename,
+            "stored_filename": (
+                stored_filename or filename
+            ),
+            "filesize": filesize,
+            "uploaded_at": (
+                datetime.now().isoformat()
+            ),
+            "status": "Indexed",
+            "user_id": user_id
+        }
+
+        documents.append(
+            document
+        )
+        self.save_documents(
+            documents
+        )
+
+        logger.info(
+            "Document metadata created | "
+            "document_id=%s | filename=%s | user_id=%s",
+            document["id"],
+            filename,
+            user_id
+        )
+        return document
+
+    # ============================================================
+    # DELETE DOCUMENT
+    # ============================================================
+    def delete_document(
+        self,
+        document_id
+    ):
+        if not document_id:
+            return None
+
+        documents = self.get_documents()
+        document_to_delete = None
+
+        for document in documents:
+            if document.get("id") == document_id:
+                document_to_delete = document
+                break
+
+        if document_to_delete is None:
+            logger.info(
+                "Document metadata not found: %s",
+                document_id
+            )
+            return None
+
+        remaining_documents = [
+            document
+            for document in documents
+            if document.get("id") != document_id
+        ]
+
+        self.save_documents(
+            remaining_documents
+        )
+
+        logger.info(
+            "Document metadata deleted | "
+            "document_id=%s",
+            document_id
+        )
+        return document_to_delete
+
+document_manager = DocumentManager()
+
+//auth_dependency.py
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from services.security import decode_access_token
+
+security = HTTPBearer(
+    auto_error=False
+)
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(
+        security
     ),
 ):
-    question = (
-        request.question.strip()
-        if request.question
+    """
+    Validate the JWT bearer token and return
+    the authenticated user information.
+    """
+    # ============================================================
+    # CREDENTIAL CHECK
+    # ============================================================
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+
+    token = (
+        credentials.credentials
+        if credentials.credentials
         else ""
     )
 
-    user_id = current_user["id"]
-
-    # ========================================================
-    # VALIDATE QUESTION
-    # ========================================================
-    if not question:
-        return {
-            "question": question,
-            "answer":
-                "Please enter a question.",
-            "sources": [],
-            "conversation_id":
-                request.conversation_id,
-        }
-
-    # ========================================================
-    # GET CURRENT USER DOCUMENTS
-    #
-    # These are ALL documents currently uploaded by the user.
-    # They are stored separately from current_documents,
-    # which represents documents used by the latest answer.
-    # ========================================================
-    all_documents = (
-        document_manager
-        .get_documents()
-    )
-
-    user_documents = [
-        document
-        for document in all_documents
-        if document.get(
-            "user_id"
-        ) == user_id
-    ]
-
-    available_document_names = []
-
-    available_document_ids = []
-
-    for document in user_documents:
-        document_id = document.get(
-            "id"
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
         )
-
-        filename = document.get(
-            "filename"
-        )
-
-        if (
-            document_id
-            and document_id
-            not in available_document_ids
-        ):
-            available_document_ids.append(
-                document_id
-            )
-
-        if (
-            filename
-            and filename
-            not in available_document_names
-        ):
-            available_document_names.append(
-                filename
-            )
-
-    logger.info(
-        "Available user documents | "
-        "user=%s | documents=%s",
-        user_id,
-        available_document_names,
-    )
-
-    # ========================================================
-    # GET OR CREATE CONVERSATION
-    # ========================================================
-    conversation = (
-        conversation_service
-        .get_or_create_conversation(
-            user_id=user_id,
-            conversation_id=(
-                request.conversation_id
-            ),
-            document_ids=(
-                available_document_ids
-            ),
-            document_names=(
-                available_document_names
-            ),
-        )
-    )
-
-    conversation_id = conversation[
-        "id"
-    ]
-
-    # ========================================================
-    # ALWAYS REFRESH AVAILABLE DOCUMENTS
-    #
-    # This is important because the user can upload another
-    # PDF after a conversation has already started.
-    #
-    # Example:
-    #
-    # Q1 -> Inbound.pdf uploaded
-    # Upload -> Outbound.pdf
-    # Q2 -> "What about the outbound one?"
-    #
-    # The existing conversation must now know about both.
-    # ========================================================
-    conversation_service.set_available_documents(
-        user_id=user_id,
-        conversation_id=conversation_id,
-        document_ids=available_document_ids,
-        document_names=available_document_names,
-    )
-
-    logger.info(
-        "Conversation available documents updated | "
-        "conversation=%s | documents=%s",
-        conversation_id,
-        available_document_names,
-    )
-
-    logger.info(
-        "Received question: %s | "
-        "user=%s | conversation=%s",
-        question,
-        user_id,
-        conversation_id,
-    )
-
-    # ========================================================
-    # PREVIOUS CONVERSATION CONTEXT
-    # ========================================================
-    conversation_context = (
-        conversation_service.get_context(
-            user_id=user_id,
-            conversation_id=conversation_id,
-        )
-    )
-
-    last_question = (
-        conversation_context.get(
-            "last_question"
-        )
-    )
-
-    last_answer = (
-        conversation_context.get(
-            "last_answer"
-        )
-    )
-
-    current_documents = (
-        conversation_context.get(
-            "current_documents",
-            []
-        )
-    )
-
-    available_documents = (
-        conversation_context.get(
-            "available_documents",
-            []
-        )
-    )
-
-    logger.info(
-        "Conversation context | "
-        "conversation=%s | "
-        "last_question=%s | "
-        "last_answer=%s | "
-        "current_documents=%s | "
-        "available_documents=%s",
-        conversation_id,
-        last_question,
-        last_answer,
-        current_documents,
-        available_documents,
-    )
-
-    # ========================================================
-    # DETECT QUESTION TYPE
-    # ========================================================
-    normalized_question = (
-        question.lower()
-    )
-
-    # ========================================================
-    # FOLLOWUP DETECTION
-    # ========================================================
-    is_follow_up = _detect_follow_up_question(
-        question=question,
-        last_question=last_question,
-        last_answer=last_answer,
-        current_documents=current_documents,
-    )
-
-    # ========================================================
-    # EXPLICIT DOCUMENT REFERENCE
-    # ========================================================
-    explicit_document = _detect_explicit_document(
-        question=question,
-        available_documents=available_documents,
-    )
-
-    logger.info(
-        "Question Context detection | "
-        "conversation=%s | "
-        "is_follow_up=%s | "
-        "explicit_document=%s",
-        conversation_id,
-        is_follow_up,
-        explicit_document,
-    )
-
-    # ========================================================
-    # REWRITE FOLLOW-UP QUESTION
-    # ========================================================
-    rewritten_question = question
-    target_document = explicit_document
-
-    if is_follow_up:
-        rewrite_result = rewrite_followup_question(
-            question=question,
-            last_question=last_question,
-            last_answer=last_answer,
-            current_documents=available_documents,
-            explicit_document=explicit_document,
-        )
-
-        rewritten_question = (
-            rewrite_result.get(
-                "standalone_question",
-                question,
-            )
-            or question
-        )
-
-        target_document = (
-            rewrite_result.get(
-                "target_document"
-            )
-            or explicit_document
-        )
-
-        logger.info(
-            "Follow-up rewrite | "
-            "conversation=%s | "
-            "original=%s | "
-            "rewritten=%s | "
-            "target_document=%s",
-            conversation_id,
-            question,
-            rewritten_question,
-            target_document,
-        )
-    else:
-        logger.info(
-            "Question is standalone | question=%s",
-            question,
-        )
-
-    signature_keywords = [
-        "signatory",
-        "signatories",
-        "signature",
-        "signatures",
-        "signed",
-        "signed by",
-        "who signed",
-
-        "authorized signatory",
-        "authorised signatory",
-
-        "esign",
-        "e sign",
-    ]
-
-    is_signature_question = any(
-        keyword
-        in normalized_question
-        for keyword
-        in signature_keywords
-    )
-
-    # ========================================================
-    # RETRIEVE
-    #
-    # We request more results for signature questions because
-    # the actual signature block may be several chunks away.
-    # ========================================================
-    retrieval_k = (
-        8
-        if is_signature_question
-        else 5
-    )
-
-    results = vector_store.search(
-        query=rewritten_question,
-        top_k=retrieval_k,
-        user_id=user_id,
-    )
-
-    # ========================================================
-    # SIGNATURE RESULTS
-    #
-    # vector_store already performs signature-aware ranking.
-    # We only perform a conservative final ordering here.
-    # ========================================================
-    if is_signature_question:
-        signature_results = [
-            result
-            for result in results
-            if result.get(
-                "signature_score",
-                0.0
-            ) > 0
-        ]
-
-        if signature_results:
-            other_results = [
-                result
-                for result in results
-                if result
-                not in signature_results
-            ]
-
-            signature_results.sort(
-                key=lambda result: (
-                    result.get(
-                        "signature_score",
-                        0.0
-                    ),
-                    result.get(
-                        "final_score",
-                        0.0
-                    ),
-                ),
-                reverse=True
-            )
-
-            results = (
-                signature_results
-                + other_results
-            )
-
-            results = results[:4]
-
-            logger.info(
-                "Signature-aware result selection: %s",
-                len(results)
-            )
-
-    # ========================================================
-    # NO RESULTS
-    # ========================================================
-    if not results:
-        return {
-            "question":
-                question,
-
-            "answer":
-                "Please upload PDF first.",
-
-            "sources":
-                [],
-
-            "conversation_id":
-                conversation_id,
-        }
-
-    # ========================================================
-    # LOG RETRIEVED RESULTS
-    # ========================================================
-
-    logger.info(
-        "Retrieved %s relevant chunks for: %s",
-        len(results),
-        rewritten_question
-    )
-
-    for rank, result in enumerate(
-        results,
-        start=1
-    ):
-        logger.info(
-            "ASK RESULT %s | FILE=%s | PAGE=%s | "
-            "CHUNK=%s | FINAL=%.4f | "
-            "RELEVANCE=%.4f | SIGNATURE=%.4f | "
-            "FINANCIAL=%.4f",
-            rank,
-            result.get(
-                "filename"
-            ),
-            result.get(
-                "page_number"
-            ),
-            result.get(
-                "chunk_index"
-            ),
-            result.get(
-                "final_score",
-                0.0
-            ),
-            result.get(
-                "relevance_score",
-                0.0
-            ),
-            result.get(
-                "signature_score",
-                0.0
-            ),
-            result.get(
-                "financial_score",
-                0.0
-            ),
-        )
-
-    # ========================================================
-    # BUILD GEMINI CONTEXT
-    # ========================================================
-    context_parts = []
-
-    for result in results:
-        context_parts.append(
-            f"""
-DOCUMENT:
-{result.get("filename", "")}
-
-PAGE:
-{result.get("page_number", "Not specified")}
-
-CHUNK:
-{result.get("chunk_index", "Not specified")}
-
-RETRIEVAL RELEVANCE:
-{result.get("relevance_score", 0.0):.3f}
-
-SEMANTIC SCORE:
-{result.get("semantic_score", 0.0):.3f}
-
-LEXICAL SCORE:
-{result.get("lexical_score", 0.0):.3f}
-
-SIGNATURE RELEVANCE:
-{result.get("signature_score", 0.0):.3f}
-
-FINANCIAL RELEVANCE:
-{result.get("financial_score", 0.0):.3f}
-
-CONTENT:
-{result.get("text", "")}
-"""
-        )
-
-    context = (
-        "\n\n====================\n\n"
-        .join(context_parts)
-    )
-
-    # ========================================================
-    # GEMINI
-    # ========================================================
-    answer = ask_gemini(
-        context,
-        rewritten_question
-    )
-
-    # ========================================================
-    # STORE CONVERSATION MESSAGE
-    #
-    # For now the question is stored unchanged.
-    # Actual follow-up rewriting comes in the next step.
-    # ========================================================
-    conversation_service.add_message(
-        user_id=user_id,
-        conversation_id=conversation_id,
-        question=question,
-        answer=answer,
-        rewritten_question=rewritten_question,
-        sources=results,
-    )
-
-    logger.info(
-        "Conversation message stored | "
-        "conversation=%s | question=%s",
-        conversation_id,
-        question,
-    )
-
-    # ========================================================
-    # SOURCES
-    # ========================================================
-    sources = []
-
-    for result in results:
-        sources.append(
-            {
-                "document_id":
-                    result.get(
-                        "document_id"
-                    ),
-
-                "filename":
-                    result.get(
-                        "filename"
-                    ),
-
-                "page_number":
-                    result.get(
-                        "page_number"
-                    ),
-
-                "chunk_index":
-                    result.get(
-                        "chunk_index"
-                    ),
-
-                "text":
-                    result.get(
-                        "text",
-                        ""
-                    ),
-
-                "score":
-                    result.get(
-                        "final_score",
-                        0.0
-                    ),
-
-                "relevance_score":
-                    result.get(
-                        "relevance_score",
-                        0.0
-                    ),
-
-                "semantic_score":
-                    result.get(
-                        "semantic_score",
-                        0.0
-                    ),
-
-                "lexical_score":
-                    result.get(
-                        "lexical_score",
-                        0.0
-                    ),
-
-                "signature_score":
-                    result.get(
-                        "signature_score",
-                        0.0
-                    ),
-
-                "financial_score":
-                    result.get(
-                        "financial_score",
-                        0.0
-                    ),
-            }
-        )
-
-    # ========================================================
-    # RESPONSE
-    # ========================================================
-    return {
-        "question":
-            question,
-
-        "answer":
-            answer,
-
-        "sources":
-            sources,
-
-        "conversation_id":
-            conversation_id,
-    }
-
-
-# ============================================================
-# DOCUMENT LIST
-# ============================================================
-
-@app.get("/documents")
-def list_documents(
-    current_user: dict = Depends(
-        get_current_user
-    )
-):
-
-    user_id = current_user["id"]
-
-    documents = (
-        document_manager
-        .get_documents()
-    )
-
-    user_documents = [
-        document
-        for document in documents
-        if document.get(
-            "user_id"
-        ) == user_id
-    ]
-
-    return {
-
-        "total_documents":
-            len(user_documents),
-
-        "documents":
-            user_documents,
-    }
-
-
-# ============================================================
-# CONSISTENCY
-# ============================================================
-
-@app.get("/documents/consistency")
-def document_consistency(
-    current_user: dict = Depends(
-        get_current_user
-    )
-):
-
-    return vector_store.check_consistency(
-        user_id=current_user["id"]
-    )
-
-
-# ============================================================
-# DELETE DOCUMENT
-# ============================================================
-
-@app.delete("/documents/{document_id}")
-def delete_document(
-    document_id: str,
-    current_user: dict = Depends(
-        get_current_user
-    ),
-):
-
-    user_id = current_user["id"]
-
-    logger.info(
-        "Delete request received: document=%s | user=%s",
-        document_id,
-        user_id
-    )
 
     # ============================================================
-    # FIND USER DOCUMENT
+    # JWT VALIDATION
     # ============================================================
-
-    documents = (
-        document_manager
-        .get_documents()
-    )
-
-    document = next(
-        (
-            item
-            for item in documents
-            if item.get("id")
-            == document_id
-            and item.get("user_id")
-            == user_id
-        ),
-        None
-    )
-
-    if document is None:
-
-        logger.warning(
-            "Document not found: document=%s | user=%s",
-            document_id,
-            user_id
-        )
-
-        return {
-
-            "success":
-                False,
-
-            "message":
-                "Document not found.",
-        }
-
-    filename = document.get(
-        "filename",
-        ""
-    )
-
-    stored_filename = document.get(
-        "stored_filename",
-        filename
-    )
-
-    # ============================================================
-    # DELETE FAISS
-    # ============================================================
-
     try:
-
-        faiss_deleted = (
-            vector_store
-            .delete_document(
-                document_id
-            )
+        payload = decode_access_token(
+            token
         )
 
-    except Exception as exc:
-
-        logger.exception(
-            "FAISS deletion failed: %s",
-            document_id
-        )
-
+    except Exception:
         raise HTTPException(
-            status_code=500,
-            detail=(
-                "Document deletion stopped because "
-                "FAISS cleanup failed."
-            )
-        ) from exc
-
-    # ============================================================
-    # DELETE DOCUMENT METADATA
-    # ============================================================
-
-    deleted_document = (
-        document_manager
-        .delete_document(
-            document_id
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token.",
         )
+
+    if not payload or not isinstance(
+        payload,
+        dict
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token.",
+        )
+
+    # ============================================================
+    # REQUIRED CLAIMS
+    # ============================================================
+    user_id = payload.get(
+        "sub"
     )
 
-    if deleted_document is None:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "FAISS vectors were deleted, but document "
-                "metadata could not be removed."
-            )
-        )
-
-    # ============================================================
-    # DELETE PHYSICAL PDF
-    # ============================================================
-
-    file_path = (
-        UPLOAD_FOLDER
-        / stored_filename
+    username = payload.get(
+        "username"
     )
 
-    physical_file_deleted = False
-
-    if file_path.exists():
-
-        try:
-
-            file_path.unlink()
-
-            physical_file_deleted = True
-
-        except Exception as exc:
-
-            logger.exception(
-                "Could not delete physical PDF: %s",
-                file_path
-            )
-
-            return {
-
-                "success":
-                    True,
-
-                "message":
-                    (
-                        "Document deleted from RAG successfully, "
-                        "but physical PDF cleanup failed."
-                    ),
-
-                "document":
-                    deleted_document,
-
-                "faiss_vectors_deleted":
-                    faiss_deleted,
-
-                "physical_file_deleted":
-                    False,
-
-                "physical_file_error":
-                    str(exc),
-            }
-
-    else:
-
-        logger.warning(
-            "Physical PDF not found: %s",
-            file_path
+    if not user_id or not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token.",
         )
 
+    # ============================================================
+    # USER OBJECT
+    #
+    # Keep the existing response structure so the frontend
+    # does not need to change.
+    # ============================================================
     return {
-
-        "success":
-            True,
-
-        "message":
-            "Document deleted successfully.",
-
-        "document":
-            deleted_document,
-
-        "faiss_vectors_deleted":
-            faiss_deleted,
-
-        "physical_file_deleted":
-            physical_file_deleted,
+        "id": str(user_id),
+        "username": str(
+            username
+        ),
+        "name": str(
+            payload.get(
+                "name",
+                username
+            )
+        ),
+        "loginType": payload.get(
+            "loginType",
+            "form"
+        ),
     }
 
+//embedding_service.py
+from pathlib import Path
+import logging
 
-# ============================================================
-# SSO
-# ============================================================
+from sentence_transformers import SentenceTransformer
 
-@app.get("/auth/sso")
-async def sso_login():
+logger = logging.getLogger("uvicorn.error")
 
-    raise HTTPException(
-        status_code=501,
-        detail=(
-            "SSO login not implemented yet. "
-            "Please use the demo login."
-        ),
-    )
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_PATH = BASE_DIR / "models" / "all-MiniLM-L6-v2"
 
-
-# ============================================================
-# CUSTOM OPENAPI
-# ============================================================
-
-def custom_openapi():
-
-    if app.openapi_schema:
-        return app.openapi_schema
-
-    schema = get_openapi(
-        title=app.title,
-        version="1.0.0",
-        description="PDF RAG Backend API",
-        routes=app.routes,
-    )
-
-    components = (
-        schema
-        .get("components", {})
-        .get("schemas", {})
-    )
-
-    for component in components.values():
-
-        properties = component.get(
-            "properties",
-            {}
-        )
-
-        for prop in properties.values():
-
-            if (
-                prop.get("type")
-                == "array"
-                and isinstance(
-                    prop.get("items"),
-                    dict
-                )
-            ):
-
-                items = prop["items"]
-
-                if (
-                    items.get(
-                        "contentMediaType"
-                    )
-                    == "application/octet-stream"
-                ):
-
-                    items.pop(
-                        "contentMediaType",
-                        None
-                    )
-
-                    items["type"] = "string"
-                    items["format"] = "binary"
-
-            elif (
-                prop.get("type")
-                == "string"
-                and prop.get(
-                    "contentMediaType"
-                )
-                == "application/octet-stream"
-            ):
-
-                prop.pop(
-                    "contentMediaType",
-                    None
-                )
-
-                prop["format"] = "binary"
-
-    app.openapi_schema = schema
-
-    return app.openapi_schema
-
-
-app.openapi = custom_openapi
-
-//conversation_service.py
-import threading
-import uuid
-from collections import defaultdict
-
-class ConversationService:
+class EmbeddingService:
     def __init__(self):
-        self.conversations = defaultdict(dict)
-        self.lock = threading.Lock()
+        logger.info("Loading embedding model: %s", MODEL_PATH)
 
-    # ========================================================
-    # CREATE CONVERSATION
-    # ========================================================
-    def create_conversation(
-        self,
-        user_id,
-        document_ids=None,
-        document_names=None,
-    ):
-        conversation_id = str(uuid.uuid4())
-        conversation = {
-            "id": conversation_id,
-            "user_id": user_id,
-            "messages": [],
-            # Documents actually used by the latest answer
-            "current_document": None,
-            "current_documents": [],
-            # All documents available to this conversation
-            "available_documents": (
-                list(document_names or [])
-            ),
-            "available_document_ids": (
-                list(document_ids or [])
-            ),
-            "current_topic": None,
-            "last_question": None,
-            "last_rewritten_question": None,
-            "last_answer": None,
-            "last_sources": [],
-        }
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(f"Embedding model not found at {MODEL_PATH}")
 
-        with self.lock:
-            self.conversations[user_id][
-                conversation_id
-            ] = conversation
-        return conversation
+        self.model = SentenceTransformer(str(MODEL_PATH), local_files_only=True)
+        logger.info("Embedding model loaded successfully.")
+        logger.info("Embedding model dimension: %s", self.model.get_sentence_embedding_dimension())
 
-    # ========================================================
-    # GET CONVERSATION
-    # ========================================================
-    def get_conversation(
-        self,
-        user_id,
-        conversation_id,
-    ):
-        if not conversation_id:
-            return None
+    def embed_documents(self, texts):
 
-        with self.lock:
-            return (
-                self.conversations
-                .get(user_id, {})
-                .get(conversation_id)
-            )
+        if not texts:
+            return[]
 
-    # ========================================================
-    # GET OR CREATE CONVERSATION
-    # ========================================================
-    def get_or_create_conversation(
-        self,
-        user_id,
-        conversation_id=None,
-        document_ids=None,
-        document_names=None,
-    ):
-        if conversation_id:
-            conversation = self.get_conversation(
-                user_id,
-                conversation_id,
-            )
+        embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
 
-            if conversation:
-                return conversation
+        return embeddings.tolist()
 
-        return self.create_conversation(
-            user_id=user_id,
-            document_ids=document_ids,
-            document_names=document_names,
-        )
-
-    # ========================================================
-    # SET AVAILABLE DOCUMENTS
-    # ========================================================
-    def set_available_documents(
-        self,
-        user_id,
-        conversation_id,
-        document_ids=None,
-        document_names=None,
-    ):
-        conversation = self.get_conversation(
-            user_id,
-            conversation_id,
-        )
-
-        if not conversation:
-            return None
-
-        with self.lock:
-            if document_ids is not None:
-                conversation[
-                    "available_document_ids"
-                ] = list(document_ids)
-
-            if document_names is not None:
-                conversation[
-                    "available_documents"
-                ] = list(document_names)
-        return conversation
-
-    # ========================================================
-    # GET AVAILABLE DOCUMENTS
-    # ========================================================
-    def get_available_documents(
-        self,
-        user_id,
-        conversation_id,
-    ):
-        conversation = self.get_conversation(
-            user_id,
-            conversation_id,
-        )
-
-        if not conversation:
+    def embed_text(self, text):
+        if not text or not text.strip():
             return []
         
-        return list(
-            conversation.get(
-                "available_documents",
-                [],
-            )
+        embedding = self.model.encode(text, normalize_embeddings=True, show_progress_bar=False)
+    
+        return embedding.tolist()
+
+embedding_service = EmbeddingService()
+
+//chunk_service.py
+import logging
+logger = logging.getLogger("uvicorn.error")
+
+def split_text(
+    pages,
+    chunk_size=1000,
+    overlap=200,
+):
+    """
+    Split page-aware document text into overlapping chunks.
+    If page_number is missing/None, the position of the page
+    in the pages list is used as a fallback.
+    """
+    if not pages:
+        return []
+
+    if chunk_size <= 0:
+        raise ValueError(
+            "chunk_size must be greater than zero."
         )
 
-    # ========================================================
-    # ADD MESSAGE
-    # ========================================================
-    def add_message(
-        self,
-        user_id,
-        conversation_id,
-        question,
-        answer,
-        sources=None,
-        rewritten_question=None,
-        document_names=None,
-        topic=None,
+    if overlap < 0:
+        raise ValueError(
+            "overlap cannot be negative."
+        )
+
+    if overlap >= chunk_size:
+        raise ValueError(
+            "overlap must be smaller than chunk_size."
+        )
+
+    chunks = []
+
+    for page_index, page in enumerate(
+        pages,
+        start=1
     ):
-        conversation = self.get_conversation(
-            user_id,
-            conversation_id,
+        if not isinstance(page, dict):
+            continue
+
+        # ----------------------------------------------------
+        # Preserve supplied page number.
+        # If missing/None, fall back to actual page position.
+        # ----------------------------------------------------
+        page_number = page.get(
+            "page_number"
         )
 
-        if not conversation:
-            return None
+        if page_number is None:
+            page_number = page_index
 
-        sources = sources or []
+        text = str(
+            page.get(
+                "text",
+                ""
+            )
+        ).strip()
 
-        # ----------------------------------------------------
-        # Determine documents used by this answer
-        # ----------------------------------------------------
-        source_documents = []
-        for source in sources:
-            filename = source.get(
-                "filename"
+        if not text:
+            continue
+
+        text_length = len(text)
+
+        start = 0
+
+        while start < text_length:
+            end = min(
+                start + chunk_size,
+                text_length
             )
 
-            if (
-                filename
-                and filename
-                not in source_documents
-            ):
-                source_documents.append(
-                    filename
+            chunk_text = text[
+                start:end
+            ].strip()
+
+            if chunk_text:
+                chunks.append(
+                    {
+                        "text": chunk_text,
+                        "page_number": page_number,
+                    }
                 )
 
-        # ----------------------------------------------------
-        # Preserve explicitly supplied document names
-        # ----------------------------------------------------
-        if document_names:
-            current_documents = []
-            for filename in document_names:
-                if (
-                    filename
-                    and filename
-                    not in current_documents
-                ):
-                    current_documents.append(
-                        filename
-                    )
+            # Prevent infinite loops.
+            if end >= text_length:
+                break
+
+            start += (
+                chunk_size - overlap
+            )
+
+    logger.info(
+        "Total chunks created: %s",
+        len(chunks)
+    )
+
+    for index, chunk in enumerate(
+        chunks
+    ):
+        logger.info(
+            "--- Chunk %s | Page: %s | Characters: %s ---",
+            index + 1,
+            chunk.get("page_number"),
+            len(
+                chunk.get(
+                    "text",
+                    ""
+                )
+            ),
+        )
+    return chunks
+
+//pdf_reader.py
+from pypdf import PdfReader
+import logging
+logger = logging.getLogger("uvicorn.error")
+
+def read_pdf(file_path):
+    """
+    Extract text from a text-based PDF page by page.
+    Returns:
+        list[dict]: [
+            {
+                "page_number": 1,
+                "text": "..."
+            },
+            ...
+        ]
+    """
+    reader = PdfReader(file_path)
+
+    total_pages = len(reader.pages)
+
+    logger.info(
+        "Total pages in PDF: %s",
+        total_pages
+    )
+
+    pages = []
+
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1
+    ):
+        try:
+            page_text = page.extract_text() or ""
+
+        except Exception as exc:
+            logger.exception(
+                "Failed to extract text from page %s: %s",
+                page_number,
+                exc
+            )
+            page_text = ""
+
+        page_text = page_text.strip()
+
+        logger.info(
+            "--- Page %s ---",
+            page_number
+        )
+
+        if page_text:
+            logger.info(
+                "%s",
+                page_text
+            )
         else:
-            current_documents = (
-                source_documents
+            logger.info(
+                "[No extractable text on this page]"
             )
-
-        # ----------------------------------------------------
-        # Current document
-        # ----------------------------------------------------
-        current_document = (
-            current_documents[0]
-            if current_documents
-            else None
-        )
-
-        message = {
-            "role": "user",
-            "question": question,
-            "rewritten_question": (
-                rewritten_question
-                if rewritten_question is not None
-                else question
-            ),
-            "answer": answer,
-            "documents": current_documents,
-            "sources": sources,
-        }
-
-        with self.lock:
-            conversation[
-                "messages"
-            ].append(message)
-
-            conversation[
-                "last_question"
-            ] = question
-
-            conversation[
-                "last_rewritten_question"
-            ] = (
-                rewritten_question
-                if rewritten_question is not None
-                else question
-            )
-
-            conversation[
-                "last_answer"
-            ] = answer
-
-            conversation[
-                "last_sources"
-            ] = sources
-
-            conversation[
-                "current_documents"
-            ] = current_documents
-
-            conversation[
-                "current_document"
-            ] = current_document
-
-            if topic is not None:
-                conversation[
-                    "current_topic"
-                ] = topic
-
-            # ------------------------------------------------
-            # If documents were supplied for this message,
-            # merge them into the conversation's available
-            # document list.
-            # ------------------------------------------------
-            if document_names:
-                existing_documents = (
-                    conversation.get(
-                        "available_documents",
-                        [],
-                    )
-                )
-
-                for filename in document_names:
-                    if (
-                        filename
-                        and filename
-                        not in existing_documents
-                    ):
-                        existing_documents.append(
-                            filename
-                        )
-
-                conversation[
-                    "available_documents"
-                ] = existing_documents
-        return message
-
-    # ========================================================
-    # GET RECENT MESSAGES
-    # ========================================================
-    def get_recent_messages(
-        self,
-        user_id,
-        conversation_id,
-        limit=10,
-    ):
-        conversation = self.get_conversation(
-            user_id,
-            conversation_id,
-        )
-
-        if not conversation:
-            return []
-
-        messages = conversation.get(
-            "messages",
-            [],
-        )
-
-        return messages[-limit:]
-
-    # ========================================================
-    # GET LAST MESSAGE
-    # ========================================================
-    def get_last_message(
-        self,
-        user_id,
-        conversation_id,
-    ):
-        conversation = self.get_conversation(
-            user_id,
-            conversation_id,
-        )
-
-        if not conversation:
-            return None
-
-        messages = conversation.get(
-            "messages",
-            [],
-        )
-
-        if not messages:
-            return None
-
-        return messages[-1]
-
-    # ========================================================
-    # GET CONTEXT
-    # ========================================================
-    def get_context(
-        self,
-        user_id,
-        conversation_id,
-    ):
-        conversation = self.get_conversation(
-            user_id,
-            conversation_id,
-        )
-
-        if not conversation:
-            return {
-                "last_question": None,
-                "last_rewritten_question": None,
-                "last_answer": None,
-                "current_document": None,
-                "current_documents": [],
-                "available_documents": [],
-                "available_document_ids": [],
-                "current_topic": None,
-                "recent_messages": [],
+        pages.append(
+            {
+                "page_number": page_number,
+                "text": page_text,
             }
+        )
+    return pages
 
-        return {
-            "last_question": conversation.get(
-                "last_question"
-            ),
+//ocr_reader.py
+import fitz
+import logging
+import os
+import tempfile
 
-            "last_rewritten_question":
-                conversation.get(
-                    "last_rewritten_question"
-                ),
+from rapidocr_onnxruntime import RapidOCR
 
-            "last_answer": conversation.get(
-                "last_answer"
-            ),
+logger = logging.getLogger("uvicorn.error")
 
-            "current_document":
-                conversation.get(
-                    "current_document"
-                ),
+engine = RapidOCR()
 
-            "current_documents":
-                list(
-                    conversation.get(
-                        "current_documents",
-                        [],
-                    )
-                ),
+def read_scanned_pdf(pdf_path):
+    """
+    Perform OCR page by page on a scanned PDF.
+    
+    Returns:
+        list[dict]: [
+            {
+                "page_number": 1,
+                "text": "..."
+            },
+            ...
+        ]
+    """
 
-            "available_documents":
-                list(
-                    conversation.get(
-                        "available_documents",
-                        [],
-                    )
-                ),
+    pages = []
 
-            "available_document_ids":
-                list(
-                    conversation.get(
-                        "available_document_ids",
-                        [],
-                    )
-                ),
+    doc = None
 
-            "current_topic":
-                conversation.get(
-                    "current_topic"
-                ),
+    try:
+        doc = fitz.open(pdf_path)
 
-            "recent_messages":
-                list(
-                    conversation.get(
-                        "messages",
-                        []
-                    )[-10:]
-                ),
-        }
-
-    # ========================================================
-    # UPDATE TOPIC
-    # ========================================================
-    def update_topic(
-        self,
-        user_id,
-        conversation_id,
-        topic,
-    ):
-        conversation = self.get_conversation(
-            user_id,
-            conversation_id,
+        logger.info(
+            "OCR started. Total pages: %s",
+            len(doc)
         )
 
-        if not conversation:
-            return None
-
-        with self.lock:
-            conversation[
-                "current_topic"
-            ] = topic
-        return conversation
-
-    # ========================================================
-    # CLEAR CONVERSATION
-    # ========================================================
-    def clear_conversation(
-        self,
-        user_id,
-        conversation_id,
-    ):
-        with self.lock:
-            user_conversations = (
-                self.conversations.get(
-                    user_id,
-                    {}
-                )
+        for page_number in range(
+            len(doc)
+        ):
+            page = doc.load_page(
+                page_number
             )
 
-            if conversation_id in user_conversations:
-                del user_conversations[
-                    conversation_id
-                ]
-                return True
-        return False
+            logger.info(
+                "Starting OCR for page %s",
+                page_number + 1
+            )
 
-# ============================================================
-# GLOBAL CONVERSATION SERVICE
-# ============================================================
-conversation_service = ConversationService()
+            temp_path = None
+
+            try:
+                pix = page.get_pixmap(
+                    dpi=150
+                )
+
+                with tempfile.NamedTemporaryFile(
+                    suffix=".png",
+                    delete=False
+                ) as temp_file:
+                    temp_path = temp_file.name
+
+                pix.save(
+                    temp_path
+                )
+
+                result, _ = engine(
+                    temp_path
+                )
+
+                page_text_parts = []
+
+                if result:
+                    for item in result:
+                        if (
+                            isinstance(item, (list, tuple))
+                            and len(item) >= 2
+                        ):
+                            detected_text = str(
+                                item[1]
+                            ).strip()
+
+                            if detected_text:
+                                page_text_parts.append(
+                                    detected_text
+                                )
+                page_text = " ".join(
+                    page_text_parts
+                ).strip()
+
+                logger.info(
+                    "--- OCR Page %s ---",
+                    page_number + 1
+                )
+
+                if page_text:
+                    logger.info(
+                        "%s",
+                        page_text
+                    )
+                else:
+                    logger.info(
+                        "[No OCR text on this page]"
+                    )
+
+                pages.append(
+                    {
+                        "page_number": page_number + 1,
+                        "text": page_text,
+                    }
+                )
+
+            except Exception as exc:
+                logger.exception(
+                    "OCR failed for page %s: %s",
+                    page_number + 1,
+                    exc
+                )
+                # Preserve page information even when
+                # OCR fails for an individual page.
+                pages.append(
+                    {
+                        "page_number": page_number + 1,
+                        "text": "",
+                    }
+                )
+
+            finally:
+                if temp_path and os.path.exists(
+                    temp_path
+                ):
+                    try:
+                        os.remove(
+                            temp_path
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to remove temporary OCR file %s: %s",
+                            temp_path,
+                            exc
+                        )
+        logger.info(
+            "OCR completed successfully."
+        )
+
+        return pages
+
+    finally:
+        if doc is not None:
+            doc.close()
