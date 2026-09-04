@@ -109,11 +109,37 @@ IMPORTANT RULES:
   explicitly establishes that relationship.
 10. Do not mention retrieval, embeddings, FAISS, BM25, RRF,
    chunks, or internal implementation details.
+11. Every factual statement in your answer must be directly
+   supported by the supplied DOCUMENT CONTEXT.
+12. If the context contains conflicting values, do not choose
+   one based on outside knowledge. State that the supplied
+   context contains conflicting information.
+13. Do not merge information from different documents unless
+   the question explicitly asks for a comparison.
+14. When answering a question about an amount, rate, date,
+   person, designation, clause, or agreement term, use the
+   exact supporting passage from the relevant document context.
 DOCUMENT CONTEXT:
 {context}
 USER QUESTION:
-{question}a
+{question}
+ANSWER:
 """
+       logger.info(
+         "========== GEMINI CONTEXT DEBUG =========="
+       )
+
+       logger.info(
+         "QUESTION=%s",
+         question
+       )
+       logger.info(
+         "CONTEXT=%s",
+         context[:12000]
+       )
+       logger.info(
+         "========== END GEMINI CONTEXT DEBUG =========="
+       )
    response = model.generate_content(
        prompt
    )
