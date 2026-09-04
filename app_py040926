@@ -261,6 +261,36 @@ def _detect_explicit_document(
     if not available_documents:
         return None
 
+    # ========================================================
+    # EXACT DOCUMENT MATCH
+    # ========================================================
+    normalized_question = _normalize_document_name(
+        question
+    )
+
+    if normalized_question:
+        for filename in available_documents:
+            normalized_filename = (
+                _normalize_document_name(
+                    filename
+                )
+            )
+            if not normalized_filename:
+                continue
+
+            # Exact filename/stem match
+            if (
+                normalized_question
+                == normalized_filename
+            ):
+                logger.info(
+                    "Exact explicit document detected | "
+                    "question=%s | document=%s",
+                    question,
+                    filename,
+                )
+                return filename
+
     scored_documents = []
 
     for filename in available_documents:
