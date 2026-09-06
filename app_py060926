@@ -1205,18 +1205,6 @@ async def ask_question(
 
     # ========================================================
     # RETRIEVE
-    #
-    # We request more results for signature questions because
-    # the actual signature block may be several chunks away.
-    # ========================================================
-    retrieval_k = (
-        8
-        if is_signature_question
-        else 5
-    )
-
-    # ========================================================
-    # RETRIEVE
     # ========================================================
     retrieval_k = (
         8
@@ -1260,61 +1248,21 @@ async def ask_question(
             user_id=user_id,
             resolved_filename=None,
         )
-
-    # ========================================================
-    # SIGNATURE RESULTS
-    #
-    # vector_store already performs signature-aware ranking.
-    # We only perform a conservative final ordering here.
-    # ========================================================
-    if is_signature_question:
-        signature_results = [
-            result
-            for result in results
-            if result.get(
-                "signature_score",
-                0.0
-            ) > 0
-        ]
-
-        if signature_results:
-            other_results = [
-                result
-                for result in results
-                if result
-                not in signature_results
-            ]
-
-            signature_results.sort(
-                key=lambda result: (
-                    result.get(
-                        "signature_score",
-                        0.0
-                    ),
-                    result.get(
-                        "final_score",
-                        0.0
-                    ),
-                ),
-                reverse=True
-            )
-
-            results = (
-                signature_results
-                + other_results
-            )
-
-            results = results[:4]
-
-            logger.info(
-                "Signature-aware result selection: %s",
-                len(results)
-            )
-
+            
     # ========================================================
     # NO RESULTS
     # ========================================================
     if not results:
+        if not available_document_names:
+            answer = (
+                "Please upload PDF first."
+            )
+        else:
+            answer = (
+                "I couldn't find that information "
+                "in the uploaded document."
+            )
+            
         return {
             "question":
                 question,
