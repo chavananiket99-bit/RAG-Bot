@@ -754,6 +754,16 @@ RULES
     "is_follow_up" to false.
 
 11. Return ONLY valid JSON.
+11.5. Do not wrap the JSON in markdown.
+Return raw JSON only.
+Do not include:
+- ```json
+- ```
+- explanations
+- comments
+- additional keys
+- text before the JSON
+- text after the JSON
 
 12. Use EXACTLY this structure:
 
