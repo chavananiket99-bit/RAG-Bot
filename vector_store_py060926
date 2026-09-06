@@ -1015,6 +1015,7 @@ class FAISSVectorStore:
         query,
         top_k=20,
         user_id=None,
+        filename=None,
     ):
 
         query_tokens = self._tokenize(
@@ -1035,6 +1036,12 @@ class FAISSVectorStore:
                 if metadata.get(
                     "user_id"
                 ) != user_id:
+                    continue
+
+            if filename is not None:
+                if metadata.get(
+                    "filename"
+                ) != filename:
                     continue
 
             tokens = self._tokenize(
@@ -3303,13 +3310,20 @@ class FAISSVectorStore:
         resolved_filename=None,
     ):
         """
-        Search only within one specific document.
-        This function is intentionally isolated from the normal
-        cross-document hybrid search.
-        If a document has been explicitly selected by the application,
-        only vectors belonging to that document are eligible.
-        This prevents semantically similar chunks from another PDF
-        from entering the answer context.
+        Search ONLY inside one specific document.
+
+        IMPORTANT:
+        Unlike the previous implementation, this method does NOT
+        perform a global FAISS search followed by document filtering.
+
+        Instead:
+            1. Identify vectors belonging to the requested document.
+            2. Calculate semantic similarity only against those vectors.
+            3. Calculate lexical relevance only against those vectors.
+            4. Combine and rerank only those candidates.
+
+        This guarantees that chunks from another document cannot
+        influence document-restricted retrieval.
         """
 
         if not query or not query.strip():
@@ -3321,15 +3335,16 @@ class FAISSVectorStore:
         filename = str(filename).strip()
 
         # ========================================================
-        # FIND ALLOWED VECTOR IDS
+        # FIND DOCUMENT VECTOR IDS
         # ========================================================
+
         allowed_vector_ids = []
 
         for vector_id, metadata in self.metadata.items():
             if user_id is not None:
                 if metadata.get("user_id") != user_id:
                     continue
-            
+
             metadata_filename = (
                 metadata.get("filename", "")
             )
@@ -3341,10 +3356,12 @@ class FAISSVectorStore:
                 allowed_vector_ids.append(
                     int(vector_id)
                 )
+
             except (
                 TypeError,
                 ValueError,
             ):
+
                 continue
 
         if not allowed_vector_ids:
@@ -3354,11 +3371,13 @@ class FAISSVectorStore:
                 filename,
                 user_id,
             )
+
             return []
 
         # ========================================================
         # EMBED QUERY
         # ========================================================
+
         query_embedding = (
             embedding_service.embed_text(query)
         )
@@ -3372,59 +3391,72 @@ class FAISSVectorStore:
         )
 
         if query_vector.ndim != 2:
+
             raise ValueError(
                 "Query embedding must be a 2D vector."
             )
 
         if query_vector.shape[1] != self.dimension:
+
             raise ValueError(
-                "Embedding dimension mismatch."
+                "Embedding dimension mismatch. "
+                f"Expected={self.dimension}, "
+                f"Received={query_vector.shape[1]}"
             )
 
         # ========================================================
-        # SEARCH FAISS
+        # DOCUMENT-ONLY SEMANTIC SEARCH
         # ========================================================
-        #
-        # We search a sufficiently large portion of the index,
-        # then explicitly discard every vector that does not
-        # belong to the requested document.
         #
         # IMPORTANT:
-        # We do NOT stop before checking enough FAISS candidates.
+        # Do NOT call:
+        #
+        #     self.index.search(...)
+        #
+        # here.
+        #
+        # That searches the entire global index.
+        #
+        # Instead, reconstruct only vectors belonging to the
+        # requested document and calculate their similarity.
         # ========================================================
-        search_k = min(
-            self.index.ntotal,
-            max(
-                len(allowed_vector_ids) * 5,
-                top_k * 20,
-                100,
-            ),
-        )
 
-        scores, vector_ids = (
-            self.index.search(
-                query_vector,
-                search_k,
+        semantic_candidates = []
+
+        for vector_id in allowed_vector_ids:
+            try:
+
+                document_vector = (
+                    self.index.reconstruct(
+                        int(vector_id)
+                    )
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "Could not reconstruct FAISS vector | "
+                    "vector_id=%s | filename=%s | error=%s",
+                    vector_id,
+                    filename,
+                    exc,
+                )
+
+                continue
+
+            document_vector = np.asarray(
+                document_vector,
+                dtype="float32",
             )
-        )
 
-        allowed_ids = set(
-            allowed_vector_ids
-        )
-
-        results = []
-
-        for score, vector_id in zip(
-            scores[0],
-            vector_ids[0],
-        ):
-            if vector_id == -1:
+            if document_vector.shape[0] != self.dimension:
                 continue
 
-            vector_id = int(vector_id)
-
-            if vector_id not in allowed_ids:
-                continue
+            semantic_score = float(
+                np.dot(
+                    query_vector[0],
+                    document_vector,
+                )
+            )
 
             metadata = self.metadata.get(
                 str(vector_id)
@@ -3433,30 +3465,24 @@ class FAISSVectorStore:
             if not metadata:
                 continue
 
-            # Extra safety check.
-            if (
-                metadata.get("filename")
-                != filename
-            ):
+            # Final safety check.
+            if metadata.get("filename") != filename:
                 continue
 
             if (
                 user_id is not None
-                and metadata.get("user_id")
-                != user_id
+                and metadata.get("user_id") != user_id
             ):
                 continue
-            
-            results.append(
+
+            semantic_candidates.append(
                 {
-                    "score": float(score),
-                    "semantic_score": float(score),
+                    "score": semantic_score,
+                    "semantic_score": semantic_score,
                     "lexical_score": 0.0,
                     "vector_id": vector_id,
                     "document_id":
-                        metadata.get(
-                            "document_id"
-                        ),
+                        metadata.get("document_id"),
                     "filename":
                         metadata.get(
                             "filename",
@@ -3469,7 +3495,8 @@ class FAISSVectorStore:
                         ),
                     "page_number":
                         metadata.get(
-                            "page_number"
+                            "page_number",
+                            0,
                         ),
                     "text":
                         metadata.get(
@@ -3479,44 +3506,119 @@ class FAISSVectorStore:
                 }
             )
 
+        if not semantic_candidates:
+            return []
+
         # ========================================================
-        # LEXICAL SCORE
+        # KEEP A REASONABLE SEMANTIC CANDIDATE SET
         # ========================================================
+
+        semantic_candidates.sort(
+            key=lambda item: (
+                item.get(
+                    "semantic_score",
+                    0.0,
+                ),
+                -item.get(
+                    "chunk_index",
+                    0,
+                ),
+            ),
+            reverse=True,
+        )
+
+        candidate_limit = max(
+            top_k * 10,
+            50,
+        )
+
+        results = semantic_candidates[
+            :candidate_limit
+        ]
+
+        # ========================================================
+        # DOCUMENT-RESTRICTED LEXICAL SEARCH
+        # ========================================================
+        #
+        # IMPORTANT:
+        # The lexical search must also be restricted to this
+        # document.
+        #
+        # We do NOT search all user documents and then take the
+        # requested filename from the top 50.
+        # ========================================================
+
         lexical_results = (
             self._lexical_search(
                 query,
-                top_k=max(
-                    top_k * 10,
-                    50,
-                ),
+                top_k=candidate_limit,
                 user_id=user_id,
+                filename=filename,
             )
         )
 
         lexical_by_id = {
             item["vector_id"]: item
             for item in lexical_results
-            if item.get("filename")
-            == filename
         }
 
+        # ========================================================
+        # NORMALIZE LEXICAL SCORE
+        # ========================================================
+
+        lexical_max = max(
+            (
+                float(
+                    item.get(
+                        "score",
+                        0.0,
+                    )
+                )
+                for item in lexical_results
+            ),
+            default=0.0,
+        )
+
         for result in results:
+
             lexical = lexical_by_id.get(
                 result["vector_id"]
             )
 
             if lexical:
-                result["lexical_score"] = float(
+
+                raw_lexical_score = float(
                     lexical.get(
                         "score",
                         0.0,
                     )
                 )
 
+                if lexical_max > 0:
+
+                    result["lexical_score"] = (
+                        raw_lexical_score
+                        / lexical_max
+                    )
+
+                else:
+
+                    result["lexical_score"] = 0.0
+
+            else:
+
+                result["lexical_score"] = 0.0
+
         # ========================================================
         # RE-RANK INSIDE DOCUMENT
         # ========================================================
+
+        intent = self._detect_intent(
+            query
+        )
+
         for result in results:
+
             relevance_score = (
                 self._query_relevance_score(
                     query,
@@ -3562,6 +3664,7 @@ class FAISSVectorStore:
             # ----------------------------------------------------
             # Store individual scores
             # ----------------------------------------------------
+
             result["relevance_score"] = float(
                 relevance_score
             )
@@ -3581,11 +3684,15 @@ class FAISSVectorStore:
             # ----------------------------------------------------
             # Final score
             # ----------------------------------------------------
+            #
+            # Scores are now kept on comparable scales.
+            # ----------------------------------------------------
+
             result["final_score"] = float(
-                semantic_score * 0.40
+                semantic_score * 0.45
                 + lexical_score * 0.10
                 + relevance_score * 0.25
-                + intent_score * 0.10
+                + intent_score * 0.05
                 + signature_score * 0.075
                 + financial_score * 0.075
             )
@@ -3593,11 +3700,9 @@ class FAISSVectorStore:
         # ========================================================
         # INTENT-SPECIFIC RANKING
         # ========================================================
-        intent = self._detect_intent(
-            query
-        )
 
         if intent == "signature":
+
             results.sort(
                 key=lambda item: (
                     item.get(
@@ -3615,7 +3720,9 @@ class FAISSVectorStore:
                 ),
                 reverse=True,
             )
+
         elif intent == "financial":
+
             results.sort(
                 key=lambda item: (
                     item.get(
@@ -3633,7 +3740,9 @@ class FAISSVectorStore:
                 ),
                 reverse=True,
             )
+
         else:
+
             results.sort(
                 key=lambda item: (
                     item.get(
@@ -3648,6 +3757,10 @@ class FAISSVectorStore:
                         "semantic_score",
                         0.0,
                     ),
+                    -item.get(
+                        "chunk_index",
+                        0,
+                    ),
                 ),
                 reverse=True,
             )
@@ -3655,21 +3768,34 @@ class FAISSVectorStore:
         # ========================================================
         # FINAL DOCUMENT SAFETY CHECK
         # ========================================================
+
         results = [
             result
             for result in results
             if result.get(
                 "filename"
             ) == filename
+            and (
+                user_id is None
+                or self.metadata.get(
+                    str(result.get("vector_id")),
+                    {}
+                ).get("user_id") == user_id
+            )
         ]
+
+        # ========================================================
+        # DEBUG LOGGING
+        # ========================================================
 
         logger.info(
             "Document-restricted search completed | "
             "filename=%s | user=%s | "
-            "query=%s | results=%s",
+            "query=%s | candidates=%s | results=%s",
             filename,
             user_id,
             query,
+            len(allowed_vector_ids),
             len(results),
         )
 
@@ -3677,6 +3803,7 @@ class FAISSVectorStore:
             results[:top_k],
             start=1,
         ):
+
             logger.info(
                 "DOCUMENT RESULT %s | "
                 "FILE=%s | PAGE=%s | "
@@ -3690,13 +3817,32 @@ class FAISSVectorStore:
                 result.get("filename"),
                 result.get("page_number"),
                 result.get("chunk_index"),
-                result.get("final_score", 0.0),
-                result.get("semantic_score", 0.0),
-                result.get("lexical_score", 0.0),
-                result.get("relevance_score", 0.0),
-                result.get("signature_score", 0.0),
-                result.get("financial_score", 0.0),
+                result.get(
+                    "final_score",
+                    0.0,
+                ),
+                result.get(
+                    "semantic_score",
+                    0.0,
+                ),
+                result.get(
+                    "lexical_score",
+                    0.0,
+                ),
+                result.get(
+                    "relevance_score",
+                    0.0,
+                ),
+                result.get(
+                    "signature_score",
+                    0.0,
+                ),
+                result.get(
+                    "financial_score",
+                    0.0,
+                ),
             )
+
         return results[:top_k]
 
     def resolve_document(
