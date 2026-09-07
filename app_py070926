@@ -1,5 +1,6 @@
 //app.py
 from fastapi.openapi.utils import get_openapi
+from datetime import datetime, date
 
 from fastapi import (
     FastAPI,
@@ -349,6 +350,33 @@ def _detect_explicit_document(
     )
 
     return best_filename
+
+def _get_document_resolution_message(
+    resolution
+):
+    candidates = resolution.get(
+        "candidates",
+        []
+    )
+
+    if not candidates:
+        return None
+    
+    names = [
+        item.get("filename")
+        for item in candidates
+        if item.get("filename")
+    ]
+
+    if not names:
+        return None
+
+    return (
+        "I found multiple documents that may match your "
+        "question. Please specify the document name. "
+        "Possible matches: "
+        + ", ".join(names[:5])
+    )
 
 def _detect_follow_up_question(
     question,
@@ -839,6 +867,221 @@ async def upload_files(
             failed_documents,
     }
 
+def _detect_question_intent(question):
+    """
+    Deterministically classify the user's question.
+    This is used only to guide retrieval.
+    It does NOT answer the question.
+    """
+    if not question:
+        return "general"
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        question.lower()
+    ).strip()
+
+    signature_terms = [
+        "signatory",
+        "signatories",
+        "signature",
+        "signed",
+        "signed by",
+        "who signed",
+        "who has signed",
+        "authorized signatory",
+        "authorised signatory",
+        "esign",
+        "e sign",
+        "e-sign",
+        "electronic signature",
+        "electronically signed",
+        "digitally signed",
+        "digital signature",
+        "signdesk",
+        "execution",
+    ]
+
+    lifecycle_terms = [
+        "effective date",
+        "start date",
+        "commencement date",
+        "expiry",
+        "expiry date",
+        "end date",
+        "termination date",
+        "tenure",
+        "term",
+        "duration",
+        "validity",
+        "valid until",
+        "active",
+        "expired",
+        "renewal",
+        "renew",
+        "agreement period",
+    ]
+
+    commercial_terms = [
+        "price",
+        "pricing",
+        "rate",
+        "rent",
+        "rental",
+        "cost",
+        "amount",
+        "charge",
+        "payment",
+        "payment terms",
+        "commercial",
+        "markup",
+        "mark-up",
+        "margin",
+        "fee",
+        "consideration",
+    ]
+
+    purpose_terms = [
+        "purpose",
+        "business purpose",
+        "business rationale",
+        "business need",
+        "objective",
+        "strategic objective",
+        "why was",
+        "why did",
+        "reason for",
+        "commercial intent",
+        "business justification",
+    ]
+
+    transaction_terms = [
+        "transaction",
+        "nature of transaction",
+        "nature of activity",
+        "activity",
+        "activities",
+        "sale",
+        "purchase",
+        "service",
+        "services",
+        "design service",
+        "manufacturing",
+        "contract manufacturing",
+        "royalty",
+        "procurement",
+    ]
+
+    actualization_terms = [
+        "actualization",
+        "actualisation",
+        "actualize",
+        "actualise",
+        "actualized",
+        "actualised",
+    ]
+
+    if any(
+        term in normalized
+        for term in signature_terms
+    ):
+        return "signature"
+
+    if any(
+        term in normalized
+        for term in lifecycle_terms
+    ):
+        return "lifecycle"
+
+    if any(
+        term in normalized
+        for term in actualization_terms
+    ):
+        return "actualization"
+
+    if any(
+        term in normalized
+        for term in commercial_terms
+    ):
+        return "commercial"
+
+    if any(
+        term in normalized
+        for term in purpose_terms
+    ):
+        return "purpose"
+
+    if any(
+        term in normalized
+        for term in transaction_terms
+    ):
+        return "transaction"
+
+    return "general"
+
+def _is_strong_enough_result(
+    result,
+    intent
+):
+    if not result:
+       return False
+
+    relevance = float(
+        result.get(
+            "relevance_score",
+            0.0
+        )
+    )
+
+    semantic = float(
+        result.get(
+            "semantic_score",
+            0.0
+        )
+    )
+
+    lexical = float(
+        result.get(
+            "lexical_score",
+            0.0
+        )
+    )
+
+    signature = float(
+        result.get(
+            "signature_score",
+            0.0
+        )
+    )
+
+    financial = float(
+        result.get(
+            "financial_score",
+            0.0
+        )
+    )
+
+    if intent == "signature":
+        return (
+            signature >= 0.20
+            or relevance >= 0.20
+            or semantic >= 0.40
+        )
+
+    if intent == "commercial":
+        return (
+            financial >= 0.20
+            or relevance >= 0.20
+            or lexical >= 1.0
+            or semantic >= 0.40
+        )
+
+    return (
+        relevance >= 0.15
+        or semantic >= 0.35
+        or lexical >= 1.0
+    )
 
 # ============================================================
 # ASK
@@ -1152,6 +1395,13 @@ async def ask_question(
     
     resolved_filename = target_document
 
+    document_resolution = {
+        "filename": resolved_filename,
+        "score": 0.0,
+        "ambiguous": False,
+        "candidates": [],
+    }
+
     if not resolved_filename:
         document_resolution = vector_store.resolve_document(
             rewritten_question,
@@ -1161,6 +1411,14 @@ async def ask_question(
         resolved_filename = (
             document_resolution.get("filename")
         )
+
+        if document_resolution.get("ambiguous"):
+            return {
+                "question": question,
+                "answer": _get_document_resolution_message(document_resolution),
+                "sources": [],
+                "conversation_id": conversation_id,
+            }
 
     logger.info(
         "Final document resolution | "
@@ -1188,12 +1446,24 @@ async def ask_question(
         "signed",
         "signed by",
         "who signed",
-
+        "who has signed",
+        "who executed",
+        "execution",
         "authorized signatory",
         "authorised signatory",
-
+        "authorized representative",
+        "authorised representative",
+        "representative",
         "esign",
         "e sign",
+        "e-sign",
+        "electronic signature",
+        "electronically signed",
+        "digital signed",
+        "digital signature",
+        "signed electronically",
+        "sign desk",
+        "signdesk"
     ]
 
     is_signature_question = any(
@@ -1206,10 +1476,44 @@ async def ask_question(
     # ========================================================
     # RETRIEVE
     # ========================================================
-    retrieval_k = (
-        8
-        if is_signature_question
-        else 5
+    # retrieval_k = (
+    #     8
+    #     if is_signature_question
+    #     else 5
+    # )
+
+    # ========================================================
+    # QUESTION INTENT + RETRIEVAL SIZE
+    # ========================================================
+    question_intent = _detect_question_intent(
+        rewritten_question
+    )
+
+    retrieval_k_by_intent = {
+        "signature": 10,
+        "lifecycle": 8,
+        "commercial": 8,
+        "purpose": 7,
+        "transaction": 7,
+        "actualization": 8,
+        "general": 5,
+    }
+
+    retrieval_k = retrieval_k_by_intent.get(
+        question_intent,
+        5
+    )
+
+    is_signature_question = (
+        question_intent == "signature"
+    )
+
+    logger.info(
+        "Question intent resolved | "
+        "question=%s | intent=%s | retrieval_k=%s",
+        rewritten_question,
+        question_intent,
+        retrieval_k,
     )
 
     # --------------------------------------------------------
@@ -1268,7 +1572,7 @@ async def ask_question(
                 question,
 
             "answer":
-                "Please upload PDF first.",
+                answer,
 
             "sources":
                 [],
@@ -1276,6 +1580,38 @@ async def ask_question(
             "conversation_id":
                 conversation_id,
         }
+
+    # ============================================================
+    # FILTER WEAK RESULTS
+    # ============================================================
+    strong_results = [
+        result
+        for result in results
+        if _is_strong_enough_result(
+            result,
+            question_intent
+        )
+    ]
+
+    if not strong_results:
+        logger.warning(
+            "No sufficiently strong evidence found | "
+            "intent=%s | question=%s",
+            question_intent,
+            rewritten_question,
+        )
+
+        return {
+            "question": question,
+            "answer":
+                "I couldn't find that information "
+                "in the uploaded document.",
+            "sources": [],
+            "conversation_id":
+                conversation_id,
+        }
+    
+    results = strong_results
 
     # ========================================================
     # LOG RETRIEVED RESULTS
