@@ -47,6 +47,27 @@ def calculate_signature_score(text):
         text
     ).strip().lower()
 
+    esign_matches = list(
+        re.finditer(
+            r"\be\s*sign\b|\besign\b|\belectronic(?:ally)?\s+sign(?:ed|ature)?\b",
+            normalized
+        )
+    )
+
+    signdesk_matches = list(
+        re.finditer(
+            r"\bsigndesk\b|\bsign\s*desk\b",
+            normalized
+        )
+    )
+
+    executed_matches = list(
+        re.finditer(
+            r"\bexecuted\s+by\b|\bsigned\s+by\b",
+            normalized
+        )
+    )
+
     behalf_matches = list(
         re.finditer(
             r"\bfor\s+and\s+on\s+behalf\s+of\b",
@@ -67,6 +88,22 @@ def calculate_signature_score(text):
             normalized
         )
     )
+
+    # --------------------------------------------------------
+    # Electronic signature evidence
+    # --------------------------------------------------------
+    if esign_matches:
+        if signdesk_matches:
+            return 0.95
+        return 0.80
+
+    # --------------------------------------------------------
+    # Explicit execution evidence
+    # --------------------------------------------------------
+    if executed_matches:
+        if name_matches:
+            return 0.95
+        return 0.75
 
     title_matches = list(
         re.finditer(
@@ -172,10 +209,17 @@ def calculate_signature_score(text):
     # --------------------------------------------------------
 
     if signature_matches and name_matches:
-        return 0.5
+        return 0.70
 
     if signature_matches:
-        return 0.2
+        return 0.30
+
+    if name_matches and (
+        esign_matches
+        or signdesk_matches
+        or executed_matches
+    ):
+        return 0.85
 
     return 0.0
 
@@ -1985,10 +2029,12 @@ class FAISSVectorStore:
     # ========================================================
 
     def _detect_intent(self, query):
-
         normalized = self._normalize_text(
             query
         )
+
+        if not normalized:
+            return "general"
 
         signature_terms = [
             "signatory",
@@ -1998,20 +2044,98 @@ class FAISSVectorStore:
             "signed",
             "signed by",
             "who signed",
+            "who has signed",
             "authorized signatory",
             "authorised signatory",
+            "authorized representative",
+            "authorised representative",
             "esign",
             "e sign",
+            "e-sign",
+            "electronic signature",
+            "electronically signed",
+            "digital signature",
+            "digitally signed",
+            "signdesk",
+            "execution",
+            "executed by",
         ]
 
-        rent_terms = [
+        lifecycle_terms = [
+            "effective date",
+            "start date",
+            "commencement date",
+            "expiry",
+            "expiry date",
+            "end date",
+            "termination date",
+            "tenure",
+            "duration",
+            "validity",
+            "valid until",
+            "agreement period",
+            "renewal",
+            "renew",
+            "active",
+            "expired",
+        ]
+
+        actualization_terms = [
+            "actualization",
+            "actualisation",
+            "actualize",
+            "actualise",
+            "actualized",
+            "actualised",
+        ]
+
+        commercial_terms = [
+            "price",
+            "pricing",
+            "rate",
             "rent",
             "rental",
-            "price",
             "cost",
-            "rate",
             "amount",
             "charge",
+            "payment",
+            "commercial",
+            "markup",
+            "mark-up",
+            "margin",
+            "fee",
+            "consideration",
+        ]
+
+        purpose_terms = [
+            "purpose",
+            "business purpose",
+            "business rationale",
+            "business need",
+            "business justification",
+            "commercial intent",
+            "strategic objective",
+            "objective",
+            "reason for",
+            "why was",
+            "why did",
+        ]
+
+        transaction_terms = [
+            "transaction",
+            "nature of transaction",
+            "nature of activity",
+            "activities",
+            "activity",
+            "purchase",
+            "sale",
+            "service",
+            "services",
+            "design service",
+            "manufacturing",
+            "contract manufacturing",
+            "royalty",
+            "procurement",
         ]
 
         if any(
@@ -2022,9 +2146,33 @@ class FAISSVectorStore:
 
         if any(
             term in normalized
-            for term in rent_terms
+            for term in lifecycle_terms
         ):
-            return "financial"
+            return "lifecycle"
+
+        if any(
+            term in normalized
+            for term in actualization_terms
+        ):
+            return "actualization"
+
+        if any(
+            term in normalized
+            for term in commercial_terms
+        ):
+            return "commercial"
+
+        if any(
+            term in normalized
+            for term in purpose_terms
+        ):
+            return "purpose"
+
+        if any(
+            term in normalized
+            for term in transaction_terms
+        ):
+            return "transaction"
 
         return "general"
 
@@ -2660,6 +2808,21 @@ class FAISSVectorStore:
                 )
             )
 
+            lifecycle_score = self._lifecycle_score(
+                query,
+                result["text"]
+            )
+
+            purpose_score = self._purpose_score(
+                query,
+                result["text"]
+            )
+
+            transaction_score = self._transaction_score(
+                query,
+                result["text"]
+            )
+
             document_reference_boost = 0.0
 
             if (
@@ -2686,19 +2849,49 @@ class FAISSVectorStore:
             # when the question actually asks for them.
             # ------------------------------------------------
 
+            intent_bonus = 0.0
+            
+            intent = self._detect_intent(
+                query
+            )
+
+            if intent == "signature":
+                intent_bonus = (
+                    signature_score * 0.15
+                )
+
+            elif intent == "commercial":
+                intent_bonus = (
+                    financial_score * 0.15
+                )
+
+            elif intent == "lifecycle":
+                intent_bonus = (
+                    lifecycle_score * 0.15
+                )
+
+            elif intent == "purpose":
+                intent_bonus = (
+                    purpose_score * 0.15
+                )
+
+            elif intent == "transaction":
+                intent_bonus = (
+                    transaction_score * 0.15
+                )
+
             final_score = (
-                semantic_score * 0.45
-                + relevance_score * 0.20
-                + fusion_score * 0.10
-                + document_score * 0.05
-                + document_reference_boost
+                semantic_score * 0.40
+                + lexical_score * 0.10
+                + relevance_score * 0.25
                 + intent_score * 0.05
-                + signature_score * 0.075
-                + financial_score * 0.075
+                + intent_bonus
+                + signature_score * 0.025
+                + financial_score * 0.025
             )
 
             result["fusion_score"] = float(
-                fusion_score
+                final_score
             )
 
             result["semantic_score"] = (
@@ -3301,6 +3494,161 @@ class FAISSVectorStore:
                     document_counts,
             }
 
+    def _lifecycle_score(
+        self,
+        query,
+        text
+    ):
+        if (
+            self._detect_intent(query)
+            != "lifecycle"
+        ):
+            return 0.0
+        
+        if not text:
+            return 0.0
+
+        normalized = self._normalize_text(
+            text
+        )
+
+        lifecycle_terms = {
+            "effective",
+            "commencement",
+            "start",
+            "expiry",
+            "expire",
+            "termination",
+            "term",
+            "tenure",
+            "duration",
+            "validity",
+            "renewal",
+            "renew",
+            "period",
+            "until",
+        }
+
+        matched = set(
+            self._tokenize(
+                normalized
+            )
+        ).intersection(
+            lifecycle_terms
+        )
+
+        if not matched:
+            return 0.0
+
+        score = min(
+            1.0,
+            len(matched) * 0.15
+        )
+
+        return float(score)
+
+    def _purpose_score(
+        self,
+        query,
+        text
+    ):
+        if (
+            self._detect_intent(query)
+            != "purpose"
+        ):
+            return 0.0
+
+        if not text:
+            return 0.0
+
+        normalized = self._normalize_text(
+            text
+        )
+
+        purpose_terms = {
+            "purpose",
+            "objective",
+            "business",
+            "rationale",
+            "need",
+            "intent",
+            "strategic",
+            "commercial",
+            "reason",
+            "scope",
+        }
+
+        tokens = set(
+            self._tokenize(
+                normalized
+            )
+        )
+
+        matched = tokens.intersection(
+            purpose_terms
+        )
+
+        if not matched:
+            return 0.0
+
+        return float(
+            min(
+                1.0,
+                len(matched) * 0.15
+            )
+        )
+
+    def _transaction_score(
+        self,
+        query,
+        text
+    ):
+        if (
+            self._detect_intent(query)
+            != "transaction"
+        ):
+            return 0.0
+
+        if not text:
+            return 0.0
+
+        normalized = self._normalize_text(
+            text
+        )
+
+        transaction_terms = {
+            "purchase",
+            "sale",
+            "service",
+            "services",
+            "manufacturing",
+            "royalty",
+            "procurement",
+            "design",
+            "supply",
+            "transportation",
+        }
+
+        tokens = set(
+            self._tokenize(
+                normalized
+            )
+        )
+
+        matched = tokens.intersection(
+            transaction_terms
+        )
+
+        if not matched:
+            return 0.0
+
+        return float(
+            min(
+                1.0,
+                len(matched) * 0.15
+            )
+        )    
+
     def search_in_document(
         self,
         query,
@@ -3647,6 +3995,27 @@ class FAISSVectorStore:
                 )
             )
 
+            lifecycle_score = (
+                self._lifecycle_score(
+                    query,
+                    result["text"],
+                )
+            )
+
+            purpose_score = (
+                self._purpose_score(
+                    query,
+                    result["text"],
+                )
+            )
+
+            transaction_score = (
+                self._transaction_score(
+                    query,
+                    result["text"],
+                )
+            )
+ 
             semantic_score = float(
                 result.get(
                     "semantic_score",
@@ -3679,6 +4048,18 @@ class FAISSVectorStore:
 
             result["financial_score"] = float(
                 financial_score
+            )
+
+            result["lifecycle_score"] = float(
+                lifecycle_score
+            )
+
+            result["purpose_score"] = float(
+                purpose_score
+            )
+
+            result["transaction_score"] = float(
+                transaction_score
             )
 
             # ----------------------------------------------------
