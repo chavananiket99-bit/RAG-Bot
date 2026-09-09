@@ -1,4 +1,4 @@
-//gemini_service.py
+# gemini_service.py
 # ============================================================
 # gemini_service.py
 # ============================================================
@@ -97,6 +97,7 @@ def _is_signature_question(question):
 def ask_gemini(
     context,
     question,
+    current_date=None,
 ):
     """
     Answer a question using ONLY the supplied document context.
@@ -127,6 +128,12 @@ def ask_gemini(
 
     if not context.strip():
         return NO_INFORMATION_RESPONSE
+
+    current_date = (
+        str(current_date).strip()
+        if current_date
+        else "Not provided"
+    )
 
     is_signature_question = (
         _is_signature_question(
@@ -209,7 +216,34 @@ STRICT SIGNATORY RULES
 
     "{NO_INFORMATION_RESPONSE}"
 
-14. Do not mention:
+14. Electronic-signature evidence is valid when the document
+    explicitly contains evidence such as:
+
+    - eSign
+    - e-Sign
+    - Electronic Signature
+    - Electronically Signed
+    - Digitally Signed
+    - SignDesk
+    - Signed by
+    - Executed by
+
+15. When an electronic signature block contains a person's name
+    immediately associated with an eSign/signature event, that
+    person may be identified as a signatory.
+
+16. Do not identify SignDesk itself as the person who signed.
+    SignDesk is only evidence of the electronic-signature process
+    unless the document explicitly identifies it as a party.
+
+17. If multiple electronic signature events are present, identify
+    each person separately.
+
+18. If the document shows a person's name and an eSign event but
+    does not explicitly show their company or designation, do not
+    infer either one.
+
+19. Do not mention:
     - FAISS
     - embeddings
     - retrieval
@@ -356,6 +390,54 @@ STRICT DOCUMENT-GROUNDING RULES
     - RRF
     - ranking
     - internal implementation
+
+16. Treat retrieval scores, page numbers, chunk numbers, document
+    labels, and other metadata as navigation information only.
+    They are not factual evidence.
+
+17. Do not answer a question merely because the retrieved content
+    is topically related.
+
+18. The answer must be supported by actual DOCUMENT CONTENT text.
+
+19. If the supplied content contains only partial evidence, answer
+    only the supported portion and explicitly state what is not
+    specified.
+
+20. For questions asking "who", "which company", "what date",
+    "what amount", "what rate", "what percentage", or "what
+    clause", do not derive the answer from a name, number, or
+    keyword appearing in an unrelated section.
+
+21. If the question asks for a calculated value and the document
+    provides the required inputs, perform only the calculation
+    necessary to answer the question. Do not introduce external
+    assumptions.
+
+22. If a date, duration, amount, rate, or percentage must be
+    calculated, clearly distinguish the document-stated value from
+    the calculated value.
+
+============================================================
+LIFECYCLE DATE HANDLING
+============================================================
+
+The application provides the current system date below.
+For agreement lifecycle questions only, you may compare this
+system date with effective/start/end/expiry dates explicitly
+stated in the DOCUMENT CONTENT.
+
+Do not treat the system date as a date stated by the agreement.
+Do not invent an agreement date.
+If the document provides an expiry/end date and the system date
+is after it, the agreement is expired.
+If the system date falls within an explicitly stated validity
+period, the agreement is active.
+If the document does not provide enough dates, say that the
+status cannot be determined from the document.
+
+CURRENT SYSTEM DATE:
+{current_date}
 
 ============================================================
 IMPORTANT SOURCE RULE
